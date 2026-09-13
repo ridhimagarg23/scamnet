@@ -23,6 +23,7 @@ import ChatPanel from '@/components/ChatPanel';
 import OverviewPanel from '@/components/OverviewPanel';
 import ReportModal from '@/components/ReportModal';
 import IntegrationsModal from '@/components/IntegrationsModal';
+import ModelSelector from '@/components/ModelSelector';
 import ErrorToast from '@/components/ErrorToast';
 import { apiFetch } from '@/lib/api';
 import { INITIAL_DASHBOARD_DATA, THINKING_STEPS } from '@/lib/constants';
@@ -46,6 +47,12 @@ export default function DashboardPage() {
   const [isReportOpen, setIsReportOpen] = useState(false);
   const [isIntegrationsOpen, setIsIntegrationsOpen] = useState(false);
   const [timerSeconds, setTimerSeconds] = useState(0);
+  // LLM provider/model picked in the AI Engine bar (ModelSelector).
+  // Nulls mean "use the server-side active selection".
+  const [llmSelection, setLlmSelection] = useState({
+    provider: null,
+    model: null,
+  });
 
   const timerRef = useRef(null);
   const thinkingIntervalRef = useRef(null);
@@ -152,10 +159,17 @@ export default function DashboardPage() {
     });
 
     try {
+      // Carry the AI Engine bar's choice so this turn runs on the
+      // picked provider/model (the backend falls back automatically
+      // when the pick is unavailable).
+      const payload = { message, session_id: sessionId };
+      if (llmSelection.provider) payload.provider = llmSelection.provider;
+      if (llmSelection.model) payload.model = llmSelection.model;
+
       const response = await apiFetch('/analyze', {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message, session_id: sessionId })
+        body: JSON.stringify(payload)
       });
 
       const data = await response.json();
@@ -261,6 +275,13 @@ export default function DashboardPage() {
           onChangePersona={handleChangePersona}
           onEndInvestigation={handleEndInvestigation}
           onGenerateReport={handleGenerateReport}
+        />
+
+        {/* AI Engine bar: provider toggle + model picker */}
+        <ModelSelector
+          onSelectionChange={(provider, model) =>
+            setLlmSelection({ provider, model })
+          }
         />
 
         {/* 3-panel content row */}

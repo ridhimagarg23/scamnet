@@ -111,7 +111,7 @@ export async function createApiError(response) {
       case 504:
         message =
           'The backend could not complete the upstream AI/Telegram request. ' +
-          'Check that the backend, OPENROUTER_API_KEY, and integrations are configured.';
+          'Check that the backend, LLM keys (OPENROUTER_API_KEY / NVIDIA_NIM_API_KEY), and integrations are configured.';
         break;
       default:
         message = `Trace request failed (HTTP ${response.status}).`;

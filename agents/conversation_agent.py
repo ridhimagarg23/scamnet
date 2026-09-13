@@ -46,16 +46,28 @@ TELEGRAM_PROMPT_FILE = "telegram_assistant_prompt.txt"
 
 class ConversationAgent:
 
-    def __init__(self):
+    def __init__(
+        self,
+        provider: str | None = None,
+        model: str | None = None,
+    ):
         """Load the LLM client and the conversation prompt template.
 
         The Telegram prompt is NOT read here: it is loaded on first use
         by ``_get_telegram_prompt()`` so that importing/constructing the
         agent for the dashboard channel never depends on a file that
         only the Telegram worker needs.
+
+        Parameters
+        ----------
+        provider : str | None
+            ``"openrouter"`` / ``"nvidia"`` override. ``None`` uses the
+            runtime-active provider.
+        model : str | None
+            Explicit model id override. ``None`` uses the active model.
         """
 
-        self.llm = LLMClient()
+        self.llm = LLMClient(provider=provider, model=model)
 
         self.prompt = PromptLoader.load(
             "conversation_prompt.txt"

@@ -2706,3 +2706,198 @@ body.dark .integ-icon.gmail {
   border-radius: 4px;
   background: var(--border-light);
 }
+
+/* ═══════════════════════════════════════════
+   7. AI ENGINE BAR (LLM provider + model picker)
+   Provider toggle (OpenRouter / NVIDIA NIM), model dropdown,
+   live-refresh button and the fallback status readout.
+   ═══════════════════════════════════════════ */
+.llm-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 10px 14px;
+  margin-bottom: 14px;
+  box-shadow: var(--shadow-sm);
+}
+
+.llm-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+.llm-bolt {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  background: var(--brand-light);
+  color: var(--brand-mid);
+  border: 1px solid var(--brand-muted);
+}
+
+.llm-bolt svg {
+  width: 15px;
+  height: 15px;
+}
+
+.llm-toggle {
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 999px;
+  background: var(--border-light);
+  border: 1px solid var(--border);
+}
+
+.llm-toggle-btn {
+  border: 0;
+  background: transparent;
+  padding: 6px 14px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text-3);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.llm-toggle-btn:hover:not(:disabled) {
+  color: var(--text-1);
+}
+
+.llm-toggle-btn.active {
+  background: var(--card);
+  color: var(--text-1);
+  box-shadow: var(--shadow-sm);
+}
+
+.llm-toggle-btn.unconfigured {
+  opacity: 0.6;
+}
+
+.llm-toggle-btn:disabled {
+  cursor: wait;
+}
+
+.llm-select {
+  flex: 1 1 220px;
+  max-width: 380px;
+  min-width: 180px;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--card);
+  color: var(--text-1);
+  cursor: pointer;
+}
+
+.llm-select:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.llm-refresh {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  font-size: 16px;
+  line-height: 1;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--card);
+  color: var(--text-2);
+  cursor: pointer;
+}
+
+.llm-refresh:hover:not(:disabled) {
+  border-color: var(--brand);
+  color: var(--brand-mid);
+}
+
+.llm-refresh:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.llm-meta {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+.llm-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-4);
+  flex-shrink: 0;
+}
+
+.llm-dot.live {
+  background: var(--success);
+  box-shadow: 0 0 0 3px var(--success-bg);
+}
+
+.llm-dot.catalog {
+  background: var(--warning);
+  box-shadow: 0 0 0 3px var(--warning-bg);
+}
+
+.llm-status-line {
+  font-size: 12.5px;
+  color: var(--text-3);
+  font-weight: 600;
+}
+
+.llm-status-line.llm-warn {
+  color: var(--warning);
+}
+
+.llm-hint {
+  flex-basis: 100%;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-2);
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-border);
+  border-radius: var(--r-sm);
+  padding: 8px 10px;
+}
+
+body.dark .llm-toggle-btn.active {
+  background: var(--card);
+}
+
+@media (max-width: 900px) {
+  .llm-meta {
+    margin-left: 0;
+  }
+
+  .llm-select {
+    max-width: none;
+  }
+}

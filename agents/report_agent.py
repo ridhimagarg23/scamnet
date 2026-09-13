@@ -25,10 +25,23 @@ from utils.schemas import (
 
 class ReportAgent:
 
-    def __init__(self):
-        """Load the LLM client and the report prompt template."""
+    def __init__(
+        self,
+        provider: str | None = None,
+        model: str | None = None,
+    ):
+        """Load the LLM client and the report prompt template.
 
-        self.llm = LLMClient()
+        Parameters
+        ----------
+        provider : str | None
+            ``"openrouter"`` / ``"nvidia"`` override. ``None`` uses the
+            runtime-active provider.
+        model : str | None
+            Explicit model id override. ``None`` uses the active model.
+        """
+
+        self.llm = LLMClient(provider=provider, model=model)
 
         self.prompt = PromptLoader.load(
             "report_prompt.txt"
