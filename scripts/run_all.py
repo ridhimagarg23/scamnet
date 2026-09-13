@@ -30,8 +30,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -163,6 +165,47 @@ def encode_for_console(text: str) -> str:
         return text
     except (UnicodeEncodeError, LookupError):
         return text.encode("ascii", "replace").decode("ascii")
+
+
+def _remove_readonly(func, path: str, _exc_info) -> None:
+    """Make a cache entry removable on Windows, then retry its operation."""
+
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
+def clear_next_dev_cache() -> bool:
+    """Remove Next's disposable dev cache before starting the dashboard.
+
+    Next.js recursively probes entries in ``.next`` with ``readlink`` while
+    starting its webpack hot reloader.  On Windows, files restored or locked
+    by OneDrive can make that probe fail with ``EINVAL`` even though the file
+    is a normal file (commonly ``app-build-manifest.json``).  The directory
+    is generated output and is safe to recreate, so clearing it here avoids
+    carrying the broken cache into the next run.
+    """
+
+    next_dir = FRONTEND_DIR / ".next"
+
+    if not next_dir.exists():
+        return True
+
+    print("[..] Clearing the Next.js development cache...")
+
+    for attempt in range(3):
+        try:
+            shutil.rmtree(next_dir, onerror=_remove_readonly)
+            return True
+        except OSError as exc:
+            if attempt == 2:
+                print(
+                    "[!] Could not clear frontend/.next. Close any other "
+                    f"Next.js process and retry ({exc})."
+                )
+                return False
+            time.sleep(0.5)
+
+    return False
 
 
 # ------------------------------------------------------------------
@@ -334,6 +377,12 @@ def main() -> int:
             if result.returncode != 0:
                 print("[x] npm install failed - fix that and re-run.")
                 return 1
+
+        # Next's .next directory is disposable build output.  Clear it before
+        # every dev launch so stale/OneDrive-restored entries cannot crash the
+        # hot reloader during its startup cleanup.
+        if not clear_next_dev_cache():
+            return 1
 
     # ----------------------------------------------------------
     # Environment for the children
