@@ -12,8 +12,12 @@
 //    never a fake connected/disconnected state.
 //  * The Connect button forwards to POST /api/integrations/{id}/connect
 //    and renders the server's honest outcome: 501 -> "Setup required"
-//    (auth flow not implemented yet), 409 -> missing server-side
-//    credentials. It never simulates a successful authentication.
+//    (auth flow unavailable), 409 -> missing/invalid server-side
+//    credentials, 502 -> a real attempt failed (e.g. Google rejected the
+//    key). It never simulates a successful authentication.
+//  * The server's ``setup_instructions`` are shown for apps that are not
+//    connected yet, so an operator can see exactly what to put in the
+//    server-side .env instead of guessing.
 //
 // Visual pattern: same modal shell as ReportModal (modal-overlay /
 // modal-card / modal-header / modal-body / modal-footer) + namespaced
@@ -24,7 +28,8 @@ import React, { useCallback, useEffect, useState } from 'react';
 import {
   INTEGRATION_FALLBACKS,
   fetchIntegrationStatuses,
-  connectIntegration
+  connectIntegration,
+  disconnectIntegration
 } from '@/lib/integrations';
 
 // Per-app icons (inline stroke SVGs, same style as the rest of the UI).
@@ -51,6 +56,13 @@ const INTEGRATION_ICONS = {
       <polyline points="16 16 12 12 8 16" />
       <line x1="12" y1="12" x2="12" y2="21" />
       <path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3" />
+    </svg>
+  ),
+  // Gmail: envelope (evidence inbox + report delivery)
+  gmail: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="2" y="4" width="20" height="16" rx="2" />
+      <polyline points="22 6 12 13 2 6" />
     </svg>
   )
 };
@@ -149,6 +161,44 @@ export default function IntegrationsModal({ isOpen, onClose }) {
     }
   };
 
+  // Disconnect an established session (never touches credentials).
+  const handleDisconnect = async (id) => {
+    setBusyMap((prev) => ({ ...prev, [id]: true }));
+    setAttempts((prev) => ({ ...prev, [id]: null }));
+
+    try {
+      const { ok, status: httpStatus, body } = await disconnectIntegration(id);
+
+      if (ok) {
+        await refresh();
+        return;
+      }
+
+      const detail = body?.detail || {};
+      const message =
+        typeof detail === 'string' ? detail : detail.message || null;
+
+      setAttempts((prev) => ({
+        ...prev,
+        [id]: {
+          kind: httpStatus === 404 ? 'setup' : 'error',
+          text: message || `Disconnect failed (HTTP ${httpStatus}).`
+        }
+      }));
+    } catch (err) {
+      console.error('Disconnect request error:', err);
+      setAttempts((prev) => ({
+        ...prev,
+        [id]: {
+          kind: 'error',
+          text: 'Backend unreachable - cannot disconnect right now.'
+        }
+      }));
+    } finally {
+      setBusyMap((prev) => ({ ...prev, [id]: false }));
+    }
+  };
+
   // Render nothing unless open (same contract as ReportModal).
   if (!isOpen) return null;
 
@@ -161,24 +211,27 @@ export default function IntegrationsModal({ isOpen, onClose }) {
     const name = st?.name || fallback.name || id;
     const purpose = st?.purpose || fallback.purpose || '';
 
+    const setup = st?.setup_instructions || '';
+    const configured = Boolean(st?.configured);
+
     if (isLoading && !st) {
-      return { name, purpose, kind: 'unknown', label: 'Checking...', detail: '', attempt: null };
+      return { name, purpose, kind: 'unknown', label: 'Checking...', detail: '', setup: '', configured: false, attempt: null };
     }
     if (!st) {
       // Backend unreachable / not loaded: honest "unknown" - never
       // presented as connected.
-      return { name, purpose, kind: 'unknown', label: 'Status unknown', detail: '', attempt: null };
+      return { name, purpose, kind: 'unknown', label: 'Status unknown', detail: '', setup: '', configured: false, attempt: null };
     }
     if (st.connected) {
-      return { name, purpose, kind: 'connected', label: 'Connected', detail: st.detail || '', attempt: null };
+      return { name, purpose, kind: 'connected', label: 'Connected', detail: st.detail || '', setup, configured, attempt: null };
     }
     if (attempt?.kind === 'setup') {
-      return { name, purpose, kind: 'setup', label: 'Setup required', detail: st.detail || '', attempt };
+      return { name, purpose, kind: 'setup', label: 'Setup required', detail: st.detail || '', setup, configured, attempt };
     }
     if (attempt?.kind === 'error') {
-      return { name, purpose, kind: 'error', label: 'Connection failed', detail: st.detail || '', attempt };
+      return { name, purpose, kind: 'error', label: 'Connection failed', detail: st.detail || '', setup, configured, attempt };
     }
-    return { name, purpose, kind: 'off', label: 'Not connected', detail: st.detail || '', attempt: null };
+    return { name, purpose, kind: 'off', label: 'Not connected', detail: st.detail || '', setup, configured, attempt: null };
   };
 
   return (
@@ -241,18 +294,53 @@ export default function IntegrationsModal({ isOpen, onClose }) {
                       {view.attempt.text}
                     </p>
                   )}
+
+                  {/* Server-reported, secret-free facts about a live
+                      session (bot username, Google account, ...) */}
+                  {view.kind === 'connected' && st?.connection_info &&
+                    Object.keys(st.connection_info).length > 0 && (
+                      <p className="integ-connection-info">
+                        {Object.entries(st.connection_info)
+                          .filter(([, value]) => value !== null && value !== undefined && value !== '')
+                          .map(([key, value]) => `${key.replace(/_/g, ' ')}: ${value}`)
+                          .join(' · ')}
+                      </p>
+                    )}
+
+                  {/* What the operator must do on the SERVER to make
+                      this app connect (env vars + credentials file). */}
+                  {view.kind !== 'connected' && view.setup && (
+                    <details className="integ-setup">
+                      <summary>
+                        {view.configured
+                          ? 'How to finish connecting'
+                          : 'Setup instructions'}
+                      </summary>
+                      <p>{view.setup}</p>
+                    </details>
+                  )}
                 </div>
 
                 <div className="integ-action">
                   {view.kind === 'connected' ? (
                     // Only shown when the SERVER reports a real,
                     // health-verified authenticated session.
-                    <span className="integ-connected-chip">
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
-                        <polyline points="20 6 9 17 4 12" />
-                      </svg>
-                      Connected
-                    </span>
+                    <>
+                      <span className="integ-connected-chip">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                          <polyline points="20 6 9 17 4 12" />
+                        </svg>
+                        Connected
+                      </span>
+                      <button
+                        className="btn-outline integ-disconnect-btn"
+                        type="button"
+                        disabled={busy}
+                        onClick={() => handleDisconnect(id)}
+                      >
+                        {busy ? 'Working...' : 'Disconnect'}
+                      </button>
+                    </>
                   ) : (
                     <button
                       className="btn-outline integ-connect-btn"

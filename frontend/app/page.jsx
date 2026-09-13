@@ -15,7 +15,7 @@
 
 "use client";
 
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import Sidebar from '@/components/Sidebar';
 import Topbar from '@/components/Topbar';
 import PersonaPanel from '@/components/PersonaPanel';
@@ -24,6 +24,7 @@ import OverviewPanel from '@/components/OverviewPanel';
 import ReportModal from '@/components/ReportModal';
 import IntegrationsModal from '@/components/IntegrationsModal';
 import ErrorToast from '@/components/ErrorToast';
+import { apiUrl } from '@/lib/api';
 import { INITIAL_DASHBOARD_DATA, THINKING_STEPS } from '@/lib/constants';
 
 // Creates a unique id per investigation so backend sessions never
@@ -49,22 +50,10 @@ export default function DashboardPage() {
   const timerRef = useRef(null);
   const thinkingIntervalRef = useRef(null);
 
-  // Determine API base URL:
-  // 1) NEXT_PUBLIC_API_URL (build-time override for deployments)
-  // 2) localhost:8001 when running in a local browser
-  // 3) the default hosted backend (Railway) fallback
-  const getApiUrl = useCallback(() => {
-    if (process.env.NEXT_PUBLIC_API_URL) {
-      return process.env.NEXT_PUBLIC_API_URL.replace(/\/+$/, '');
-    }
-    if (typeof window !== 'undefined') {
-      const hostname = window.location.hostname;
-      if (hostname === 'localhost' || hostname === '127.0.0.1') {
-        return 'http://127.0.0.1:8001';
-      }
-    }
-    return 'https://traceai-backend-rg.up.railway.app';
-  }, []);
+  // API calls always go through lib/api.js: same-origin /backend-api
+  // (proxied by next.config.mjs) unless NEXT_PUBLIC_API_URL overrides
+  // it. The browser therefore never talks to 127.0.0.1 or to a
+  // hard-coded host that may not exist.
 
   // Session timer: ticks every second while the dashboard is mounted
   // (drives the "Running • MM:SS" readout in the top bar).
@@ -162,8 +151,7 @@ export default function DashboardPage() {
     });
 
     try {
-      const apiUrl = getApiUrl();
-      const response = await fetch(`${apiUrl}/analyze`, {
+      const response = await fetch(apiUrl('/analyze'), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message, session_id: sessionId })
@@ -201,10 +189,9 @@ export default function DashboardPage() {
   const handleNewInvestigation = async () => {
     setIsLoading(true);
     try {
-      const apiUrl = getApiUrl();
       // Best effort: backend session is cleared so a future /analyze
       // with the SAME id starts fresh (we also rotate the id anyway).
-      await fetch(`${apiUrl}/new`, {
+      await fetch(apiUrl('/new'), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId })
@@ -313,7 +300,7 @@ export default function DashboardPage() {
       />
 
       {/* SCAMNET Connected Apps: honest integration status
-          (Telegram / Google Sheets / Google Drive) */}
+          (Telegram / Google Sheets / Google Drive / Gmail) */}
       <IntegrationsModal
         isOpen={isIntegrationsOpen}
         onClose={() => setIsIntegrationsOpen(false)}

@@ -53,11 +53,10 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
 
+from config import settings
+
 from integrations import get_integration
-from integrations.base import (
-    IntegrationConnectionError,
-    IntegrationNotConfiguredError,
-)
+from integrations.base import IntegrationConnectionError
 from integrations.telegram.client import (
     MAX_TEXT_LENGTH,
     TelegramIntegration,
@@ -162,6 +161,29 @@ class ResetChatRequest(BaseModel):
 # --------------------------------------------------
 # Shared guards
 # --------------------------------------------------
+
+def _require_llm_configured() -> None:
+    """
+    Raise an honest 503 when the server has no OpenRouter key.
+
+    The Telegram integration can be perfectly connected while the LLM
+    side is not configured; without this guard the failure would surface
+    as a confusing "conversation_failed" 502 from inside an agent.
+    """
+
+    if not settings.llm_configured:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "status": "llm_not_configured",
+                "message": (
+                    "OPENROUTER_API_KEY is not set on the server, so the "
+                    "conversation agents cannot run. Add it to the "
+                    "server-side .env and restart the backend."
+                ),
+            },
+        )
+
 
 def _require_connected_telegram() -> TelegramIntegration:
     """
@@ -336,10 +358,12 @@ def telegram_conversation_message(
     multi-turn undercover conversation.
 
     Returns ``{"status": "replied", ...turn payload}``. A malformed
-    payload is a 400; a failure inside the agents is a sanitised 502.
+    payload is a 400; a failure inside the agents is a sanitised 502;
+    a missing server-side LLM key is an explicit 503.
     """
 
     _require_connected_telegram()
+    _require_llm_configured()
 
     service = get_conversation_service()
 
@@ -392,6 +416,7 @@ def telegram_conversation_start():
     """
 
     integration = _require_connected_telegram()
+    _require_llm_configured()
 
     worker = start_worker(integration)
 

@@ -10,7 +10,7 @@
 // History / Saved Cases are future features: clicking them bubbles
 // up through onShowNotImplemented (alert stub in page.jsx).
 // Connected Apps opens the SCAMNET IntegrationsModal (honest external
-// app connection status - Telegram / Google Sheets / Google Drive).
+// app connection status - Telegram / Google Sheets / Google Drive / Gmail).
 // -------------------------------------------------------------------
 
 import React from 'react';

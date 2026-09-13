@@ -474,8 +474,6 @@ def stop_worker(
         the polling thread outlived ``timeout``.
     """
 
-    global _WORKER
-
     if _WORKER is None or not _WORKER.is_running():
         return True
 

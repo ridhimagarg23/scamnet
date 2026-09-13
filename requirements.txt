@@ -19,6 +19,13 @@ pydantic==2.13.4
 # ------------------------------------------------------------------
 httpx==0.28.1
 
+# Google OAuth 2.0 credentials (service account / authorized user) used
+# by the Google Drive, Google Sheets and Gmail integrations. Only this
+# package is needed: REST calls go through httpx, so the heavy
+# google-api-python-client / google-auth-oauthlib packages are NOT
+# required to run the server.
+google-auth==2.42.0
+
 # ------------------------------------------------------------------
 # Frontend build / misc tooling pulled in by earlier experimentation
 # (kept only if actually used; not required by backend/api.py)

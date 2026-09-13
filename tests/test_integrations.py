@@ -29,29 +29,29 @@ from integrations import (
 )
 from integrations.base import (
     IntegrationNotConfiguredError,
-    IntegrationNotImplementedError,
     IntegrationState,
 )
 from integrations.telegram import TelegramIntegration
 from integrations.google_sheets import GoogleSheetsIntegration
 from integrations.google_drive import GoogleDriveIntegration
+from integrations.gmail import GmailIntegration
 
 
-ALL_IDS = ("telegram", "google_sheets", "google_drive")
+ALL_IDS = ("telegram", "google_sheets", "google_drive", "gmail")
 
 ALL_CLASSES = (
     TelegramIntegration,
     GoogleSheetsIntegration,
     GoogleDriveIntegration,
+    GmailIntegration,
 )
 
-# Providers whose real auth flow is NOT implemented yet. Telegram is
-# excluded: it now performs real Bot API calls and is covered (with
-# mocked HTTP) in tests/test_telegram_integration.py.
-UNIMPLEMENTED_CLASSES = (
-    GoogleSheetsIntegration,
-    GoogleDriveIntegration,
-)
+# Every provider now implements a REAL connect flow (Bot API getMe for
+# Telegram; authorized Google API calls for Drive/Sheets/Gmail). The
+# mocked-transport coverage for those flows lives in
+# tests/test_telegram_integration.py and
+# tests/test_google_integrations.py - this module pins the
+# honest-status contract that must hold no matter what.
 
 
 def make_settings(**overrides):
@@ -64,10 +64,13 @@ def make_settings(**overrides):
     base = dict(
         TELEGRAM_BOT_TOKEN=None,
         TELEGRAM_API_BASE="https://api.telegram.org",
+        GOOGLE_CREDENTIALS_FILE=None,
         GOOGLE_SHEETS_CREDENTIALS_FILE=None,
         GOOGLE_SHEETS_SPREADSHEET_ID=None,
+        GOOGLE_SHEETS_WORKSHEET=None,
         GOOGLE_DRIVE_CREDENTIALS_FILE=None,
         GOOGLE_DRIVE_FOLDER_ID=None,
+        GOOGLE_GMAIL_CREDENTIALS_FILE=None,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -75,8 +78,8 @@ def make_settings(**overrides):
 
 class TestIntegrationRegistry(unittest.TestCase):
 
-    def test_three_core_integrations_registered(self):
-        """The registry exposes exactly the three SCAMNET core apps."""
+    def test_core_integrations_registered(self):
+        """The registry exposes exactly the SCAMNET core apps."""
 
         self.assertEqual(set(REGISTRY.keys()), set(ALL_IDS))
         self.assertIs(get_integration("telegram"), REGISTRY["telegram"])
@@ -133,39 +136,31 @@ class TestHonestStatus(unittest.TestCase):
                 integration.connect()
             self.assertFalse(integration.is_connected())
 
-    def test_connect_never_fakes_success_even_when_configured(self):
+    def test_wrong_credentials_file_never_claims_configured(self):
         """
-        With credentials present but the real auth flow unimplemented
-        (Google Sheets / Drive), connect() must raise
-        IntegrationNotImplementedError (501 path) and the status must
-        stay disconnected / unavailable.
+        A path that exists but is not a Google credentials JSON (this
+        test file, for instance) must stay not_configured - the operator
+        gets an actionable message instead of a failed API call, and the
+        path is never echoed back.
         """
 
-        configured_settings = {
-            # Point at a real existing file so is_configured() passes.
-            GoogleSheetsIntegration: make_settings(
-                GOOGLE_SHEETS_CREDENTIALS_FILE=__file__
-            ),
-            GoogleDriveIntegration: make_settings(
-                GOOGLE_DRIVE_CREDENTIALS_FILE=__file__
-            ),
-        }
+        for cls in (
+            GoogleSheetsIntegration,
+            GoogleDriveIntegration,
+            GmailIntegration,
+        ):
+            key = cls.required_settings[0]
+            integration = cls(make_settings(**{key: __file__}))
 
-        for cls in UNIMPLEMENTED_CLASSES:
-            integration = cls(configured_settings[cls])
-            self.assertTrue(integration.is_configured(), cls.__name__)
+            self.assertFalse(integration.is_configured(), cls.__name__)
 
-            with self.assertRaises(IntegrationNotImplementedError, msg=cls.__name__):
+            with self.assertRaises(IntegrationNotConfiguredError, msg=cls.__name__):
                 integration.connect()
 
-            self.assertFalse(integration.is_connected(), cls.__name__)
             status = integration.get_status()
-            self.assertFalse(status.connected, cls.__name__)
-            # Configured but the connect flow is not built => NOT usable.
             self.assertFalse(status.available, cls.__name__)
-            self.assertEqual(
-                status.state, IntegrationState.DISCONNECTED, cls.__name__
-            )
+            self.assertFalse(status.connected, cls.__name__)
+            self.assertNotIn(__file__, status.detail)
 
     def test_google_credentials_file_must_exist(self):
         """
@@ -215,7 +210,7 @@ class TestIntegrationEndpoints(unittest.TestCase):
     honest HTTP codes the dashboard relies on.
     """
 
-    def test_get_integrations_returns_three_honest_statuses(self):
+    def test_get_integrations_returns_honest_statuses(self):
         from backend.api import integrations_status
 
         payload = integrations_status()
@@ -234,14 +229,13 @@ class TestIntegrationEndpoints(unittest.TestCase):
             integrations_connect("unknown_app")
         self.assertEqual(ctx.exception.status_code, 404)
 
-    def test_connect_never_returns_fake_success(self):
+    def test_connect_without_credentials_is_409_not_fake_success(self):
         """
-        Whatever the environment holds, POST connect for an
-        UNIMPLEMENTED provider (Google Drive) must fail honestly:
-        409 (not_configured) without credentials, 501 (setup_required)
-        with credentials but no implemented auth flow - never a 200.
-        (Telegram's real connect flow is tested, with mocked HTTP, in
-        tests/test_telegram_integration.py.)
+        In the test environment no Google credentials exist, so POST
+        connect must answer 409 not_configured - never a 200.
+        (Telegram's and Google's real connect flows are covered with
+        mocked transports in tests/test_telegram_integration.py and
+        tests/test_google_integrations.py.)
         """
 
         from backend.api import integrations_connect
@@ -252,17 +246,19 @@ class TestIntegrationEndpoints(unittest.TestCase):
             integrations_connect("google_drive")
 
         if integration.is_configured():
-            self.assertEqual(ctx.exception.status_code, 501)
-            self.assertEqual(ctx.exception.detail["status"], "setup_required")
+            # A developer machine with real credentials would attempt a
+            # genuine connection; either it worked or it failed honestly.
+            self.assertIn(ctx.exception.status_code, (502,))
         else:
             self.assertEqual(ctx.exception.status_code, 409)
             self.assertEqual(ctx.exception.detail["status"], "not_configured")
 
-    def test_connect_configured_but_unimplemented_returns_501(self):
+    def test_connect_with_invalid_credentials_file_is_409(self):
         """
-        Simulates an operator who added GOOGLE_DRIVE_CREDENTIALS_FILE
-        to the .env: the endpoint must answer 501 setup_required (no
-        fake success) and must not echo credential details back.
+        Simulates an operator who pointed GOOGLE_DRIVE_CREDENTIALS_FILE
+        at a file that is not a Google credentials JSON: the endpoint
+        must answer 409 not_configured (never a fake success) and must
+        not echo the path back.
         """
 
         from backend.api import integrations_connect
@@ -271,8 +267,6 @@ class TestIntegrationEndpoints(unittest.TestCase):
         original_settings = integration.settings
 
         try:
-            # This test file exists on disk, so is_configured() passes
-            # without needing a real Google credentials file.
             integration.settings = make_settings(
                 GOOGLE_DRIVE_CREDENTIALS_FILE=__file__
             )
@@ -280,11 +274,21 @@ class TestIntegrationEndpoints(unittest.TestCase):
             with self.assertRaises(HTTPException) as ctx:
                 integrations_connect("google_drive")
 
-            self.assertEqual(ctx.exception.status_code, 501)
-            self.assertEqual(ctx.exception.detail["status"], "setup_required")
+            self.assertEqual(ctx.exception.status_code, 409)
+            self.assertEqual(ctx.exception.detail["status"], "not_configured")
             self.assertNotIn(__file__, str(ctx.exception.detail))
         finally:
             integration.settings = original_settings
+
+    def test_disconnect_endpoint_is_safe_and_honest(self):
+        """POST disconnect clears session state without touching config."""
+
+        from backend.api import integrations_disconnect
+
+        status = integrations_disconnect("google_drive")
+
+        self.assertFalse(status["connected"])
+        self.assertIn(status["state"], ("not_configured", "disconnected"))
 
 
 if __name__ == "__main__":

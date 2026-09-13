@@ -24,7 +24,12 @@ class PromptLoader:
     Loads prompt templates from the prompts folder.
     """
 
-    PROMPTS_DIR = Path("prompts")
+    # Resolve ``prompts/`` next to the repository root (this module
+    # lives in ``tools/``), NOT relative to the process working
+    # directory. This keeps the loader working when uvicorn is started
+    # from another directory, from a service manager or from a test
+    # runner - the same pattern MemoryManager uses for its archive.
+    PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
     @classmethod
     def load(cls, filename: str) -> str:
