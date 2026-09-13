@@ -11,6 +11,20 @@ end-to-end before any AI agent is wired to the channel:
     POST /api/telegram/send-test  - send one test text message to a
                                     specific chat_id
 
+Phase 2A conversational loop (Telegram <-> ConversationAgent):
+
+    POST /api/telegram/conversation/message - run ONE inbound message
+                                    through the investigation +
+                                    conversation pipeline and return
+                                    the persona reply (no polling)
+    POST /api/telegram/conversation/start   - start the background
+                                    polling worker (it answers every
+                                    inbound message automatically)
+    POST /api/telegram/conversation/stop    - stop the worker
+    GET  /api/telegram/conversation/status  - honest worker + chat
+                                    state snapshot (never 409)
+    POST /api/telegram/conversation/reset   - drop one chat's state
+
 Connection status itself is served by the existing integration
 endpoints in backend/api.py:
 
@@ -19,8 +33,11 @@ endpoints in backend/api.py:
 
 Safety rules enforced here
 --------------------------
-* Both routes require the integration to be genuinely connected first
-  (409 otherwise) - no anonymous drive-by usage.
+* The routes that would talk to the bot (messages, send-test,
+  conversation/message, conversation/start) require the integration to
+  be genuinely connected first (409 otherwise) - no anonymous drive-by
+  usage. Status/stop/reset stay available so an operator can always
+  observe and shut the loop down.
 * Inputs are strictly validated by pydantic (chat_id int, text 1-4096
   chars, limit/timeout/ack bounded) - no arbitrary payloads.
 * Only normalized message data is returned; the bot token never
@@ -31,6 +48,7 @@ Safety rules enforced here
 """
 
 import logging
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
@@ -43,6 +61,13 @@ from integrations.base import (
 from integrations.telegram.client import (
     MAX_TEXT_LENGTH,
     TelegramIntegration,
+)
+
+from tools.conversation_service import get_conversation_service
+from tools.telegram_conversation_worker import (
+    get_worker,
+    start_worker,
+    stop_worker,
 )
 
 logger = logging.getLogger("SCAMNET-API-Telegram")
@@ -83,6 +108,54 @@ class SendTestMessageRequest(BaseModel):
     def text_not_blank(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("text cannot be blank.")
+        return value
+
+
+class ConversationMessageRequest(BaseModel):
+    """
+    Body of POST /api/telegram/conversation/message.
+
+    Drives ONE turn of the Telegram <-> ConversationAgent loop
+    without starting the background worker - useful for manual
+    testing and for the regression suite.
+
+    chat_id : int
+        Numeric Telegram chat id the message belongs to.
+    text : str
+        The inbound message text to answer (1-4096 chars).
+    sender_username : str | None
+        Optional @handle of the sender (prompt context only).
+    """
+
+    chat_id: int
+    text: str = Field(min_length=1, max_length=MAX_TEXT_LENGTH)
+    sender_username: Optional[str] = None
+
+    @field_validator("chat_id")
+    @classmethod
+    def conversation_chat_id_non_zero(cls, value: int) -> int:
+        if value == 0:
+            raise ValueError("chat_id cannot be 0.")
+        return value
+
+    @field_validator("text")
+    @classmethod
+    def conversation_text_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("text cannot be blank.")
+        return value
+
+
+class ResetChatRequest(BaseModel):
+    """Body of POST /api/telegram/conversation/reset."""
+
+    chat_id: int
+
+    @field_validator("chat_id")
+    @classmethod
+    def reset_chat_id_non_zero(cls, value: int) -> int:
+        if value == 0:
+            raise ValueError("chat_id cannot be 0.")
         return value
 
 
@@ -236,4 +309,186 @@ def telegram_send_test(request: SendTestMessageRequest):
         "status": "sent",
         "chat_id": result["chat_id"],
         "message_id": result["message_id"],
+    }
+
+
+# --------------------------------------------------
+# Phase 2A: Telegram <-> ConversationAgent loop
+# --------------------------------------------------
+# These endpoints expose tools/conversation_service.py (one turn) and
+# tools/telegram_conversation_worker.py (the background polling loop).
+# Only the two routes that need a working bot are guarded by
+# _require_connected_telegram(); status / stop / reset stay callable so
+# an operator can always observe or shut the loop down.
+
+@router.post("/conversation/message")
+def telegram_conversation_message(
+    request: ConversationMessageRequest,
+):
+    """
+    Run ONE inbound Telegram message through the full pipeline and
+    return the persona's reply.
+
+    Pipeline: InvestigationAgent -> (accumulate IOCs + re-score risk)
+    -> AdaptiveInvestigationEngine -> ConversationAgent (Telegram
+    prompt). The chat's state (transcript, case facts, objective
+    ladder) is kept in memory, so successive calls build a coherent
+    multi-turn undercover conversation.
+
+    Returns ``{"status": "replied", ...turn payload}``. A malformed
+    payload is a 400; a failure inside the agents is a sanitised 502.
+    """
+
+    _require_connected_telegram()
+
+    service = get_conversation_service()
+
+    logger.info(
+        "Telegram conversation turn requested for chat_id=%s (%s chars).",
+        request.chat_id, len(request.text),
+    )
+
+    try:
+        result = service.handle_message(
+            request.chat_id,
+            request.text,
+            sender_username=request.sender_username,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "status": "invalid_request",
+                "message": str(exc),
+            },
+        )
+    except Exception as exc:
+        logger.error(
+            "Telegram conversation turn failed for chat_id=%s: %s",
+            request.chat_id, exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "status": "conversation_failed",
+                "message": str(exc),
+            },
+        )
+
+    return {
+        "status": "replied",
+        **result,
+    }
+
+
+@router.post("/conversation/start")
+def telegram_conversation_start():
+    """
+    Start the background worker that answers every inbound Telegram
+    message automatically.
+
+    Idempotent: calling it while the worker is already polling returns
+    the running worker instead of spawning a second loop.
+    """
+
+    integration = _require_connected_telegram()
+
+    worker = start_worker(integration)
+
+    logger.info(
+        "Telegram conversation worker start requested (running=%s).",
+        worker.is_running(),
+    )
+
+    return {
+        "status": (
+            "running" if worker.is_running() else "stopped"
+        ),
+        "worker": worker.stats(),
+    }
+
+
+@router.post("/conversation/stop")
+def telegram_conversation_stop():
+    """
+    Stop the background worker.
+
+    Deliberately NOT guarded by the connection check: an operator must
+    always be able to shut the loop down, even if Telegram dropped.
+    """
+
+    worker = get_worker()
+
+    stopped = stop_worker()
+
+    return {
+        "status": "stopped" if stopped else "stopping",
+        "worker": worker.stats() if worker else None,
+    }
+
+
+@router.get("/conversation/status")
+def telegram_conversation_status():
+    """
+    Honest snapshot of the conversational loop.
+
+    Never 409s: it reports ``configured`` / ``connected`` / ``running``
+    as booleans so the UI can reflect reality without special-casing
+    error codes. Includes per-chat state held in memory.
+    """
+
+    integration = get_integration("telegram")
+
+    service = get_conversation_service()
+    worker = get_worker()
+
+    chat_ids = service.active_chat_ids()
+
+    return {
+        "telegram": {
+            "configured": bool(
+                integration and integration.is_configured()
+            ),
+            "connected": bool(
+                integration and integration.is_connected()
+            ),
+        },
+        "running": bool(worker and worker.is_running()),
+        "worker": worker.stats() if worker else None,
+        "chat_count": len(chat_ids),
+        "chats": [
+            summary
+            for summary in (
+                service.summary(chat_id)
+                for chat_id in chat_ids
+            )
+            if summary is not None
+        ],
+    }
+
+
+@router.post("/conversation/reset")
+def telegram_conversation_reset(request: ResetChatRequest):
+    """
+    Drop all in-memory state for one chat (transcript, accumulated
+    case facts, objective ladder), so the next message starts a fresh
+    undercover persona.
+
+    Returns ``unknown_chat`` when the chat was not being tracked -
+    resetting an unknown chat is a no-op, never an error.
+    """
+
+    service = get_conversation_service()
+
+    removed = service.reset(request.chat_id)
+
+    logger.info(
+        "Telegram conversation reset for chat_id=%s (removed=%s).",
+        request.chat_id, removed,
+    )
+
+    return {
+        "status": "reset" if removed else "unknown_chat",
+        "chat_id": request.chat_id,
+        "chat_count": len(service.active_chat_ids()),
     }
