@@ -31,6 +31,15 @@ from openai import OpenAI
 from config import settings
 
 
+class LLMNotConfiguredError(RuntimeError):
+    """
+    Raised when an LLM call is attempted without a server-side
+    OpenRouter key. Kept separate from provider errors so the API can
+    answer HTTP 503 ("server not configured") rather than 502
+    ("upstream failed").
+    """
+
+
 class LLMClient:
     """
     Thin, reusable wrapper around the OpenAI SDK pointing at OpenRouter.
@@ -47,13 +56,29 @@ class LLMClient:
         """
         Build the underlying OpenAI client.
 
-        Note: we only talk to OpenRouter's gateway
+        By default we talk to OpenRouter's gateway
         (``https://openrouter.ai/api/v1``), never to OpenAI directly.
+        ``OPENROUTER_BASE_URL`` overrides the gateway for self-hosted
+        OpenAI-compatible servers or test doubles.
+
+        Raises
+        ------
+        LLMNotConfiguredError
+            ``OPENROUTER_API_KEY`` is not set on the server. The API
+            layer maps this to HTTP 503 with a configuration message
+            instead of a confusing provider-side failure.
         """
+
+        if not settings.llm_configured:
+            raise LLMNotConfiguredError(
+                "OPENROUTER_API_KEY is not configured on the server. "
+                "Add it to the server-side .env (see .env.example) and "
+                "restart the backend to enable the AI agents."
+            )
 
         self.client = OpenAI(
             api_key=settings.OPENROUTER_API_KEY,
-            base_url="https://openrouter.ai/api/v1",
+            base_url=settings.OPENROUTER_BASE_URL,
         )
 
         self.model = settings.LLM_MODEL

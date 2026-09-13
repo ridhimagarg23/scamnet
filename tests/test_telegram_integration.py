@@ -149,6 +149,28 @@ def updates_ok(*updates):
     return StubResponse({"ok": True, "result": list(updates)})
 
 
+def ok_true():
+    """``{"ok": true, "result": true}`` - deleteWebhook / setMyCommands."""
+    return StubResponse({"ok": True, "result": True})
+
+
+def connect_responses(*extra):
+    """
+    The full response queue a real ``connect()`` consumes:
+    getMe -> deleteWebhook -> setMyCommands -> (caller's extra calls).
+    """
+
+    return (getme_ok(), ok_true(), ok_true()) + tuple(extra)
+
+
+def make_connected_integration(*extra):
+    """An integration that has already completed a REAL connect()."""
+
+    integration, stub = make_integration(*connect_responses(*extra))
+    integration.connect()
+    return integration, stub
+
+
 # --------------------------------------------------
 # 1. Configuration + verify_connection (getMe)
 # --------------------------------------------------
@@ -246,14 +268,22 @@ class TestTelegramLifecycle(unittest.TestCase):
     def test_connect_success_marks_genuinely_connected(self):
         """connected=True only after Telegram itself accepted getMe."""
 
-        integration, stub = make_integration(getme_ok())
+        integration, stub = make_integration(*connect_responses())
 
         integration.connect()
 
         self.assertTrue(integration.is_connected())
-        # connect() warmed the health cache: exactly ONE getMe call,
-        # is_connected() must not hit the network again.
-        self.assertEqual(len(stub.calls), 1)
+
+        # connect() issued real Bot API calls in a safe order:
+        # getMe -> deleteWebhook -> setMyCommands.
+        methods = [call["url"].rsplit("/", 1)[-1] for call in stub.calls]
+        self.assertEqual(methods, ["getMe", "deleteWebhook", "setMyCommands"])
+
+        # ...and warmed the health cache: is_connected() must not hit
+        # the network again.
+        self.assertTrue(integration.is_connected())
+        self.assertEqual(len(stub.calls), 3)
+        self.assertTrue(integration.get_connection_info()["webhook_cleared"])
 
         status = integration.get_status()
         self.assertTrue(status.configured)
@@ -284,8 +314,7 @@ class TestTelegramLifecycle(unittest.TestCase):
     def test_disconnect_clears_session_state(self):
         """disconnect() is a local, honest state reset (no fake teardown)."""
 
-        integration, _ = make_integration(getme_ok())
-        integration.connect()
+        integration, _ = make_connected_integration()
         integration.disconnect()
 
         self.assertFalse(integration.is_connected())
@@ -297,19 +326,25 @@ class TestTelegramLifecycle(unittest.TestCase):
     def test_check_health_ttl_cache_avoids_getme_per_status(self):
         """Repeated is_connected() calls reuse the cached getMe result."""
 
-        integration, stub = make_integration(getme_ok())
-        integration.connect()
+        integration, stub = make_connected_integration()
 
         for _ in range(5):
             self.assertTrue(integration.is_connected())
 
-        self.assertEqual(len(stub.calls), 1)  # only the connect() getMe
+        # connect() ran getMe + deleteWebhook + setMyCommands; the five
+        # is_connected() calls added nothing.
+        self.assertEqual(len(stub.calls), 3)
 
     def test_check_health_failure_flips_to_disconnected(self):
         """An expired-cache health ping that fails drops the session."""
 
-        integration, stub = make_integration(getme_ok(), getme_unauthorized())
+        integration, stub = make_integration(
+            *connect_responses(getme_unauthorized())
+        )
         integration.connect()
+
+        # connect() used getMe + deleteWebhook + setMyCommands.
+        self.assertEqual(len(stub.calls), 3)
 
         # Force the TTL cache to expire.
         integration._last_health_at = time.monotonic() - 10_000
@@ -317,7 +352,9 @@ class TestTelegramLifecycle(unittest.TestCase):
         self.assertFalse(integration.is_connected())
         status = integration.get_status()
         self.assertFalse(status.connected)
-        self.assertEqual(len(stub.calls), 2)
+
+        # 3 connect() calls + the failing health-check getMe.
+        self.assertEqual(len(stub.calls), 4)
 
 
 # --------------------------------------------------
@@ -629,14 +666,14 @@ class TestTelegramEndpoints(unittest.TestCase):
     def _connected_integration(self, *extra_responses):
         """Integration already verified via a stubbed getMe."""
 
-        integration, stub = make_integration(getme_ok(), *extra_responses)
+        integration, stub = make_integration(*connect_responses(*extra_responses))
         integration.connect()
         return integration, stub
 
     # --- POST /api/integrations/telegram/connect ---
 
     def test_connect_endpoint_success_returns_honest_status(self):
-        integration, _ = make_integration(getme_ok())
+        integration, _ = make_integration(*connect_responses())
 
         with patch("backend.api.get_integration", return_value=integration):
             response = self.client.post("/api/integrations/telegram/connect")
@@ -787,8 +824,11 @@ class TestTelegramEndpoints(unittest.TestCase):
                 response = self.client.post("/api/telegram/send-test", json=body)
                 self.assertEqual(response.status_code, 422, msg=str(body)[:60])
 
-        # Validation must happen BEFORE any Telegram call.
-        self.assertEqual(len(stub.calls), 1)  # only the connect() getMe
+        # Validation must happen BEFORE any Telegram call: only the
+        # three connect() calls (getMe/deleteWebhook/setMyCommands).
+        self.assertEqual(len(stub.calls), 3)
+        for call in stub.calls:
+            self.assertFalse(call["url"].endswith("/sendMessage"))
 
     def test_send_test_requires_connection_first(self):
         integration, stub = make_integration()

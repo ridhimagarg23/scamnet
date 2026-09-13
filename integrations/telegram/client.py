@@ -23,9 +23,18 @@ This client now talks to the REAL Telegram Bot API over HTTPS:
   in-memory acknowledgement cursor (``offset``), returning messages
   normalized into ``IncomingMessage`` (see models.py). No public
   webhook server is required.
-* ``send_message()``      - ``sendMessage`` to a specific chat_id.
-* ``disconnect()``        - drops the verified-session state (the MVP
-  has no background loop or webhook to tear down).
+* ``send_message()``      - ``sendMessage`` to a specific chat_id
+  (with UTF-16-aware length checking, which is what Telegram actually
+  enforces - a 4096-emoji message is far beyond its byte budget).
+* ``send_chat_action()``  - ``sendChatAction`` (the "typing..." hint).
+* ``set_my_commands()``   - ``setMyCommands`` (declares /start in the
+  Telegram UI so an operator always has a way to ping the bot).
+* ``delete_webhook()``    - ``deleteWebhook``: a webhook configured by
+  anything else (BotFather, another deployment) makes ``getUpdates``
+  return 409 forever, which looks exactly like "the bot never replies".
+  ``connect()`` clears it, so polling always works.
+* ``disconnect()``        - drops the verified-session state (no
+  background loop or webhook is owned by this client).
 
 Deliberately NOT implemented yet (next increments):
 * no background polling loop / autonomous investigation orchestrator;
@@ -82,12 +91,20 @@ class TelegramAPIError(IntegrationConnectionError):
 
     The message is always sanitised - it never contains the bot token
     or the raw request URL. ``error_code`` carries Telegram's numeric
-    error code when one was returned (e.g. 401 Unauthorized).
+    error code when one was returned (e.g. 401 Unauthorized) and
+    ``retry_after`` mirrors ``parameters.retry_after`` - Telegram's own
+    "wait this many seconds" hint for HTTP 429 responses.
     """
 
-    def __init__(self, message: str, error_code: Optional[int] = None):
+    def __init__(
+        self,
+        message: str,
+        error_code: Optional[int] = None,
+        retry_after: Optional[int] = None,
+    ):
         super().__init__(message)
         self.error_code = error_code
+        self.retry_after = retry_after
 
 
 # --------------------------------------------------
@@ -97,7 +114,8 @@ class TelegramAPIError(IntegrationConnectionError):
 # Telegram allows 0-~50 s long-poll waits; 25 s is a safe default.
 DEFAULT_LONG_POLL_TIMEOUT = 25
 
-# Telegram rejects sendMessage texts longer than this.
+# Telegram rejects sendMessage texts longer than this MANY UTF-16 code
+# units (NOT Python characters - one emoji counts as two).
 MAX_TEXT_LENGTH = 4096
 
 # Plain requests (getMe / sendMessage) use a short timeout.
@@ -106,6 +124,51 @@ DEFAULT_HTTP_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 # check_health() caches its getMe result for this long so frequent
 # status polling does not hit Telegram on every request.
 HEALTH_CACHE_TTL_SECONDS = 60.0
+
+
+def utf16_length(text: str) -> int:
+    """
+    Number of UTF-16 code units in ``text`` - the unit Telegram counts.
+
+    Python's ``len()`` counts code points, so a 3000-emoji reply passes
+    ``len(text) <= 4096`` but is rejected by Telegram with HTTP 400
+    "message is too long". Every outbound length check/truncation must
+    therefore go through this function.
+    """
+
+    if not isinstance(text, str):
+        raise ValueError("text must be a string.")
+
+    return len(text.encode("utf-16-le")) // 2
+
+
+def truncate_for_telegram(text: str, limit: int = MAX_TEXT_LENGTH) -> str:
+    """
+    Truncate ``text`` so it fits Telegram's UTF-16 budget.
+
+    Cuts on a code-point boundary (never inside a surrogate pair) and
+    appends an ellipsis when something was dropped.
+    """
+
+    if not isinstance(text, str):
+        raise ValueError("text must be a string.")
+
+    if utf16_length(text) <= limit:
+        return text
+
+    # Reserve one code unit for the ellipsis.
+    budget = limit - 1
+    out = []
+    used = 0
+
+    for character in text:
+        width = utf16_length(character)
+        if used + width > budget:
+            break
+        out.append(character)
+        used += width
+
+    return "".join(out) + "\u2026"
 
 
 class TelegramIntegration(BaseIntegration):
@@ -160,6 +223,16 @@ class TelegramIntegration(BaseIntegration):
         # check_health() TTL cache (avoids a getMe per status poll).
         self._last_health_at: Optional[float] = None
         self._last_health_ok: Optional[bool] = None
+
+        # True once connect() confirmed no webhook can swallow updates.
+        # Surfaced (secret-free) by get_connection_info().
+        self._webhook_cleared: Optional[bool] = None
+
+        # Set by get_updates(): True when the batch Telegram returned
+        # was PENDING mail (no offset cursor yet), False when it was a
+        # long-poll wake-up. The worker uses it to answer with a
+        # one-time "I am alive" greeting instead of a fresh case.
+        self.last_poll_had_pending: bool = False
 
     # ----------------------------------------------
     # HTTP plumbing (token-safe)
@@ -260,6 +333,16 @@ class TelegramIntegration(BaseIntegration):
                 else None
             )
 
+            # Telegram's structured hint for 429s: how long to wait.
+            parameters = (
+                body.get("parameters") if isinstance(body, dict) else None
+            )
+            retry_after = None
+            if isinstance(parameters, dict):
+                candidate = parameters.get("retry_after")
+                if isinstance(candidate, int) and not isinstance(candidate, bool):
+                    retry_after = candidate
+
             message = f"Telegram Bot API error on '{method}'"
             if isinstance(error_code, int):
                 message += f" (code {error_code})"
@@ -268,11 +351,34 @@ class TelegramIntegration(BaseIntegration):
                 message += f": {self._redact(description)}"
             else:
                 message += f" (HTTP {status_code})"
+            if retry_after is not None:
+                message += f" [retry after {retry_after}s]"
 
             logger.warning(message)
-            raise TelegramAPIError(message, error_code=error_code)
+            raise TelegramAPIError(
+                message, error_code=error_code, retry_after=retry_after
+            )
 
         return body.get("result")
+
+    # ----------------------------------------------
+    # Input validation helpers
+    # ----------------------------------------------
+
+    @staticmethod
+    def _validate_chat_id(chat_id: Any) -> int:
+        """
+        Return ``chat_id`` when it is a usable Telegram chat id.
+
+        Raises ValueError otherwise (before any network call, so a bad
+        id cannot waste a round trip).
+        """
+
+        if isinstance(chat_id, bool) or not isinstance(chat_id, int):
+            raise ValueError("chat_id must be an integer Telegram chat id.")
+        if chat_id == 0:
+            raise ValueError("chat_id cannot be 0.")
+        return chat_id
 
     # ----------------------------------------------
     # Bot API operations
@@ -361,6 +467,14 @@ class TelegramIntegration(BaseIntegration):
 
         updates = result if isinstance(result, list) else []
 
+        # With no cursor yet, everything Telegram returns is PENDING
+        # mail (it queued those updates while nothing polled). Single
+        # inboxes deliver in that order, so the oldest update is very
+        # likely to be the /start Telegram itself sends when the user
+        # first opens the bot - the worker uses this flag to answer it
+        # with a one-time liveness greeting instead of opening a case.
+        self.last_poll_had_pending = bool(updates) and effective_offset is None
+
         messages: List[IncomingMessage] = []
         last_update_id: Optional[int] = None
 
@@ -408,15 +522,15 @@ class TelegramIntegration(BaseIntegration):
         """
 
         # ---- strict input validation (before any network call) ----
-        if isinstance(chat_id, bool) or not isinstance(chat_id, int):
-            raise ValueError("chat_id must be an integer Telegram chat id.")
-        if chat_id == 0:
-            raise ValueError("chat_id cannot be 0.")
+        self._validate_chat_id(chat_id)
+
         if not isinstance(text, str) or not text.strip():
             raise ValueError("text must be a non-empty string.")
-        if len(text) > MAX_TEXT_LENGTH:
+
+        # Telegram counts UTF-16 code units, not Python characters.
+        if utf16_length(text) > MAX_TEXT_LENGTH:
             raise ValueError(
-                f"text exceeds Telegram's {MAX_TEXT_LENGTH}-character limit."
+                f"text exceeds Telegram's {MAX_TEXT_LENGTH}-unit limit."
             )
 
         result = self._call_api(
@@ -436,6 +550,107 @@ class TelegramIntegration(BaseIntegration):
             "chat_id": chat.get("id") if isinstance(chat, dict) else chat_id,
             "message_id": result.get("message_id"),
         }
+
+    def send_chat_action(
+        self, chat_id: int, action: str = "typing"
+    ) -> bool:
+        """
+        Send a chat action (``typing`` by default) to ``chat_id``.
+
+        Used by the conversation worker to show the "typing..." hint
+        while the LLM writes the persona's reply, so a long turn does
+        not look like a dead bot. Best-effort by design - Telegram
+        throttles this call, and a failure must never break a reply.
+
+        Returns
+        -------
+        bool
+            True when Telegram acknowledged the action.
+        """
+
+        self._validate_chat_id(chat_id)
+
+        if not isinstance(action, str) or not action.strip():
+            raise ValueError("action must be a non-empty string.")
+
+        result = self._call_api(
+            "sendChatAction",
+            payload={"chat_id": chat_id, "action": action},
+        )
+
+        return bool(result)
+
+    def set_my_commands(self, commands: List[Dict[str, str]]) -> bool:
+        """
+        Publish the bot's command list (``setMyCommands``).
+
+        Declaring ``/start`` makes Telegram show a command menu next to
+        the input box, which gives the operator a guaranteed way to
+        check that the bot is alive.
+
+        Parameters
+        ----------
+        commands : list[dict]
+            ``[{"command": "start", "description": "..."}, ...]``
+            (1-100 entries, command text without the leading slash).
+
+        Returns
+        -------
+        bool
+            True when Telegram accepted the list.
+        """
+
+        if not isinstance(commands, list) or not commands:
+            raise ValueError("commands must be a non-empty list.")
+
+        for entry in commands:
+            if not isinstance(entry, dict):
+                raise ValueError("every command must be a dict.")
+            command = entry.get("command")
+            if not isinstance(command, str) or not command.strip():
+                raise ValueError("every command needs a non-empty name.")
+            if command.startswith("/"):
+                raise ValueError(
+                    "command names must not start with '/' (Telegram "
+                    "adds it)."
+                )
+
+        result = self._call_api(
+            "setMyCommands", payload={"commands": commands}
+        )
+
+        return bool(result)
+
+    def delete_webhook(self, drop_pending_updates: bool = False) -> bool:
+        """
+        Remove any webhook so long polling receives updates.
+
+        A bot can be subscribed to EITHER a webhook OR ``getUpdates``.
+        If a webhook is (or was) configured - by BotFather, a previous
+        deployment, or another service - every ``getUpdates`` call
+        answers HTTP 409 ``Conflict: can't use getUpdates method while
+        webhook is active``, and the bot silently never replies. This
+        call is idempotent and cheap, so ``connect()`` runs it.
+
+        Parameters
+        ----------
+        drop_pending_updates : bool
+            Ask Telegram to discard the update backlog as well. Kept
+            False by default so messages that arrived while the server
+            was down are still delivered.
+
+        Returns
+        -------
+        bool
+            True when Telegram acknowledged the call.
+        """
+
+        result = self._call_api(
+            "deleteWebhook",
+            payload={"drop_pending_updates": bool(drop_pending_updates)},
+        )
+
+        return bool(result) if isinstance(result, bool) else True
 
     # ----------------------------------------------
     # Lifecycle (BaseIntegration contract)
@@ -467,6 +682,46 @@ class TelegramIntegration(BaseIntegration):
             self._last_error = str(exc)
             raise
 
+        # ----------------------------------------------------------
+        # Clear any webhook BEFORE declaring the connection usable.
+        # ----------------------------------------------------------
+        # A webhook and getUpdates are mutually exclusive: while one is
+        # registered, Telegram answers every getUpdates call with HTTP
+        # 409 and the bot never sees a message - the classic "the bot
+        # is connected but never replies" failure. Failing the connect
+        # is the honest outcome here: better an explicit error in the
+        # dashboard than a silently mute bot.
+        try:
+            self.delete_webhook()
+            self._webhook_cleared = True
+
+        except IntegrationConnectionError as exc:
+            self._connected = False
+            self._webhook_cleared = False
+            self._last_error = (
+                "Telegram still has a webhook configured, which blocks "
+                "long polling (getUpdates). Remove it in BotFather / "
+                "with deleteWebhook, then connect again."
+            )
+            logger.warning("Telegram deleteWebhook failed: %s", exc)
+            raise TelegramAPIError(self._last_error) from None
+
+        # ----------------------------------------------------------
+        # Publish the command menu (best effort).
+        # ----------------------------------------------------------
+        # "start" gives the operator a guaranteed liveness probe: send
+        # /start to the bot and it answers even when the LLM is down.
+        try:
+            self.set_my_commands([
+                {
+                    "command": "start",
+                    "description": "Check this bot is online",
+                },
+            ])
+        except IntegrationConnectionError as exc:
+            # Cosmetic only - never block a working connection.
+            logger.warning("Could not publish bot commands: %s", exc)
+
         self._bot_info = bot_info
         self._connected = True
         self._last_error = None
@@ -495,6 +750,7 @@ class TelegramIntegration(BaseIntegration):
         self._bot_info = None
         self._last_health_ok = None
         self._last_health_at = None
+        self.last_poll_had_pending = False
         logger.info("Telegram session state cleared (disconnected).")
 
     def check_health(self) -> bool:
@@ -543,5 +799,8 @@ class TelegramIntegration(BaseIntegration):
                 "bot_id": self._bot_info.get("id"),
                 "bot_username": self._bot_info.get("username"),
                 "bot_name": self._bot_info.get("first_name"),
+                # True when connect() confirmed getUpdates is not
+                # competing with a webhook.
+                "webhook_cleared": self._webhook_cleared,
             }
         return {}

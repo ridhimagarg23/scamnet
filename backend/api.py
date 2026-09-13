@@ -45,16 +45,24 @@ import logging
 import traceback
 from typing import Dict, Optional
 
-from fastapi import FastAPI, HTTPException, status, Response
+from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+from config import settings
 
 from agents.investigation_agent import InvestigationAgent
 from agents.conversation_agent import ConversationAgent
 from agents.report_agent import ReportAgent
 
 from tools.adaptive_investigation_engine import AdaptiveInvestigationEngine
+from tools.telegram_conversation_worker import (
+    get_worker,
+    start_worker,
+    stop_worker,
+)
 from tools.conversation_session import ConversationSession
+from tools.evidence_archive import EvidenceArchiver
 from tools.memory_manager import MemoryManager
 from tools.entity_extractor import EntityExtractor
 from tools.url_checker import URLChecker
@@ -97,14 +105,18 @@ app = FastAPI(
 
 
 # --------------------------------------------------
-# Enable CORS for frontend integration
+# Enable CORS for direct (cross-origin) API consumers
 # --------------------------------------------------
+# The bundled Next.js dashboard proxies same-origin through
+# /backend-api (see frontend/next.config.mjs), so it needs no CORS
+# entry. These origins cover local development and deployments that
+# call the API directly; extend with CORS_ALLOW_ORIGINS=<csv> instead
+# of editing this file (the previous hard-coded allow-list meant a
+# dashboard on any other host could not reach the API at all).
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://trace-ai-phi.vercel.app",
-    ],
+    allow_origins=settings.CORS_ALLOW_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -137,11 +149,18 @@ app.include_router(telegram_router)
 #     "report":         ReportResult | None       (latest markdown report)
 #     "persona_profile": dict | None              (UI persona payload)
 #     "timeline":       list[dict]                (activity feed for the UI)
+#     "drive_file_id":  str | None               (archived report file id)
 #   }
 #
 # NOTE: in-memory only - state is lost on process restart. Scale-out
-# would require swapping this dict for Redis or similar.
+# would require swapping this dict for Redis or similar. The dict is
+# capped (FIFO eviction) so an unattended server cannot grow without
+# bound as new session ids keep arriving.
 sessions: Dict[str, dict] = {}
+
+#: Maximum number of concurrently retained sessions. Each session holds
+#: a transcript + IOC model, so this is a few hundred KB at most.
+MAX_SESSIONS = 200
 
 
 class InvestigationRequest(BaseModel):
@@ -244,18 +263,20 @@ def get_persona_profile(threat_type: str, state) -> dict:
     }
 
 
-def build_progress(investigation, state) -> list:
+def build_progress(investigation, state, has_report: bool = False) -> list:
     """
     Generates the 5-step investigation progress list for the UI.
 
     Each step is one of ``done`` / ``current`` / ``locked`` based on
-    the accumulated investigation and the engine's turn counter:
+    the accumulated investigation, the engine's turn counter and
+    whether a report exists yet:
 
         1. Threat Detected       - LLM flagged the message as a scam
         2. IOC Extracted         - at least one IOC family captured
         3. Undercover Engagement - dialogue has started (turn > 1)
         4. Evidence Secured      - IOCs exist AND dialogue is ongoing
-        5. Report Ready          - report has been generated
+        5. Report Ready          - a report exists AND the case has
+                                   enough evidence to hand over
 
     A sequential-cleanup pass guarantees a step can never be "locked"
     right after a "done" step (no gaps in the UI stepper).
@@ -295,7 +316,11 @@ def build_progress(investigation, state) -> list:
         },
         {
             "label": "Report\nReady",
-            "state": "current" if state.turn_number > 1 else "locked"
+            "state": (
+                "done"
+                if (has_report and has_iocs and state.turn_number > 2)
+                else ("current" if has_report else "locked")
+            )
         }
     ]
 
@@ -431,8 +456,21 @@ def root():
 
 @app.get("/health")
 def health():
+    """
+    Liveness probe, plus an honest view of what the server can do.
+
+    ``status`` is ``healthy`` when the LLM key is configured and
+    ``degraded`` when it is not - the server still serves the
+    dashboard, ``/api/integrations`` and every integration connect
+    attempt, so an operator can verify the external-app setup first.
+    """
+
+    llm_configured = bool(settings.llm_configured)
+
     return {
-        "status": "healthy"
+        "status": "healthy" if llm_configured else "degraded",
+        "llm_configured": llm_configured,
+        "llm_model": settings.LLM_MODEL if llm_configured else None,
     }
 
 
@@ -440,15 +478,16 @@ def health():
 # SCAMNET Integration Endpoints
 # --------------------------------------------------
 # Honest status of the external-app integration layer
-# (Telegram / Google Sheets / Google Drive - see integrations/).
+# (Telegram / Google Sheets / Google Drive / Gmail - see integrations/).
 #
 # Contract:
 #   * responses NEVER contain secret values (only setting names and
 #     human-readable state descriptions);
 #   * ``connected`` is only ever true after a REAL authenticated
 #     session was established and health-verified server-side;
-#   * while an auth flow is not implemented, connect attempts answer
-#     HTTP 501 ("setup_required") instead of faking success.
+#   * every provider implements a genuine connect() flow; a provider
+#     whose auth flow is ever unavailable answers HTTP 501
+#     ("setup_required") instead of faking success.
 
 @app.get("/api/integrations")
 def integrations_status():
@@ -459,7 +498,8 @@ def integrations_status():
         {
           "telegram":      {"available": bool, "connected": bool, ...},
           "google_sheets": {"available": bool, "connected": bool, ...},
-          "google_drive":  {"available": bool, "connected": bool, ...}
+          "google_drive":  {"available": bool, "connected": bool, ...},
+          "gmail":         {"available": bool, "connected": bool, ...}
         }
 
     Each value also carries name/purpose/configured/state/detail/
@@ -467,6 +507,110 @@ def integrations_status():
     """
 
     return get_all_integration_statuses()
+
+
+# ----------------------------------------------------------
+# Telegram auto-start (the reply loop must not need a manual click)
+# ----------------------------------------------------------
+# A connected bot that is not polling is indistinguishable from a broken
+# bot: the operator sends a message and nothing ever comes back. So the
+# loop is brought up automatically - at boot when the token works, and
+# immediately after a successful Connect - unless the operator turned
+# it off with TELEGRAM_AUTO_START_WORKER=0.
+
+def _telegram_worker_stats() -> Optional[Dict]:
+    """Secret-free worker snapshot (None when the loop never ran)."""
+
+    worker = get_worker()
+
+    return worker.stats() if worker else None
+
+
+def _autostart_telegram_worker(integration) -> Optional[Dict]:
+    """
+    Start the reply loop for a connected Telegram integration.
+
+    Never raises: a polling problem must not turn a successful Connect
+    into an HTTP error - it is reported inside the response instead.
+    """
+
+    if not settings.TELEGRAM_AUTO_START_WORKER:
+        return _telegram_worker_stats()
+
+    try:
+        start_worker(integration)
+
+    except Exception as exc:  # noqa: BLE001 - connect already succeeded
+        logger.warning(
+            "Telegram connected, but the reply loop could not be "
+            "started: %s",
+            exc,
+        )
+        return {
+            "running": False,
+            "start_error": str(exc),
+        }
+
+    stats = _telegram_worker_stats()
+
+    logger.info(
+        "Telegram reply loop started automatically (polls=%s).",
+        (stats or {}).get("polls"),
+    )
+
+    return stats
+
+
+def _bootstrap_telegram_on_boot() -> None:
+    """
+    Connect + start the bot in the background when a token is present.
+
+    Runs in a daemon thread so an unreachable Telegram (or a slow DNS
+    lookup) can never delay application start-up. Silent when the token
+    is simply not configured - that is a normal, supported state.
+    """
+
+    integration = get_integration("telegram")
+
+    if integration is None or not integration.is_configured():
+        logger.info(
+            "Telegram bot token not configured - reply loop not started."
+        )
+        return
+
+    if not settings.TELEGRAM_AUTO_START_WORKER:
+        logger.info(
+            "TELEGRAM_AUTO_START_WORKER is disabled - the bot will not "
+            "poll until /api/telegram/conversation/start is called."
+        )
+        return
+
+    try:
+        if not integration.is_connected():
+            integration.connect()
+
+    except Exception as exc:  # noqa: BLE001 - boot must never fail
+        logger.warning(
+            "Telegram boot connect failed (%s). The bot will not poll "
+            "until POST /api/integrations/telegram/connect succeeds.",
+            exc,
+        )
+        return
+
+    _autostart_telegram_worker(integration)
+
+
+@app.on_event("startup")
+def _startup_bootstrap() -> None:
+    """Kick off the Telegram reply loop without blocking start-up."""
+
+    import threading
+
+    threading.Thread(
+        target=_bootstrap_telegram_on_boot,
+        name="telegram-boot-bootstrap",
+        daemon=True,
+    ).start()
 
 
 @app.post("/api/integrations/{integration_id}/connect")
@@ -477,14 +621,17 @@ def integrations_connect(integration_id: str):
     Honest outcomes (no fake success states):
       404 - unknown integration id
       409 - server-side credentials missing/invalid ("not_configured")
-      501 - credentials present but the auth flow is not implemented
-            yet ("setup_required" - Google Sheets / Google Drive)
+      501 - a provider's real auth flow is unavailable
+            ("setup_required")
       502 - a real connection attempt failed ("connection_failed" -
-            e.g. Telegram rejected the token or the network is down;
-            the message is sanitised and never contains the token)
+            e.g. Telegram rejected the token, Google rejected the
+            credentials or the network is down; the message is
+            sanitised and never contains the token)
       200 - a genuine authenticated connection was established; the
             fresh IntegrationStatus payload is returned. For Telegram
-            this means getMe verified the bot (e.g. @scamnet_intel_bot).
+            that means getMe verified the bot; for the Google apps it
+            means an authorized API call (Drive about.get, Sheets
+            spreadsheet read/create, Gmail getProfile) succeeded.
     """
 
     integration = get_integration(integration_id)
@@ -537,7 +684,83 @@ def integrations_connect(integration_id: str):
         )
 
     # Reached only when connect() performed a real, verified handshake.
-    return integration.get_status().model_dump(mode="json")
+    payload = integration.get_status().model_dump(mode="json")
+
+    if integration_id == "telegram":
+        # Bring the reply loop up straight away: otherwise the operator
+        # has to know about a second endpoint before the bot answers
+        # anything, which is exactly the "bot never replies" trap.
+        payload["worker"] = _autostart_telegram_worker(integration)
+
+        if not (payload.get("worker") or {}).get("running"):
+            payload["next_step"] = (
+                "Reply loop is not running. Check the worker message in "
+                "this response, then POST /api/telegram/conversation/"
+                "start or fix the reported problem."
+            )
+
+    return payload
+
+
+@app.post("/api/integrations/{integration_id}/disconnect")
+def integrations_disconnect(integration_id: str):
+    """
+    Drop the live session of one integration (idempotent).
+
+    Disconnecting never destroys server-side credentials - the next
+    Connect attempt re-reads them - it only clears the verified session
+    so the dashboard stops claiming a live connection.
+    """
+
+    integration = get_integration(integration_id)
+
+    if integration is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Unknown integration '{integration_id}'."
+        )
+
+    logger.info(
+        f"Disconnect requested for integration '{integration_id}'."
+    )
+
+    try:
+        integration.disconnect()
+
+    except IntegrationNotImplementedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail={
+                "status": "setup_required",
+                "message": str(exc)
+            }
+        )
+
+    except IntegrationConnectionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "status": "disconnect_failed",
+                "message": str(exc)
+            }
+        )
+
+    payload = integration.get_status().model_dump(mode="json")
+
+    if integration_id == "telegram":
+        # A disconnected bot must not keep long-polling Telegram with a
+        # session the dashboard no longer claims.
+        try:
+            stop_worker()
+        except Exception as exc:  # noqa: BLE001 - disconnect succeeded
+            logger.warning(
+                "Telegram disconnected, but the reply loop could not be "
+                "stopped: %s", exc,
+            )
+
+        payload["worker"] = _telegram_worker_stats()
+
+    return payload
 
 
 @app.options("/new")
@@ -584,6 +807,24 @@ def analyze(request: InvestigationRequest):
             detail="Message cannot be empty."
         )
 
+    # Honest, explicit failure when the server has no LLM key: 503 with
+    # an actionable message instead of a provider-side stack trace.
+    # (The rest of the API - /health, /api/integrations, Telegram
+    # status - keeps working, so an operator can verify integrations
+    # before wiring the LLM.)
+    if not settings.llm_configured:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "status": "llm_not_configured",
+                "message": (
+                    "OPENROUTER_API_KEY is not set on the server, so the "
+                    "AI agents cannot run. Add it to the server-side "
+                    ".env (see .env.example) and restart the backend."
+                )
+            }
+        )
+
     logger.info(
         f"Processing message in session '{session_id}': "
         f"{message[:50]}..."
@@ -599,6 +840,17 @@ def analyze(request: InvestigationRequest):
         # accumulate across turns.
 
         if session_id not in sessions:
+
+            # FIFO eviction: dicts preserve insertion order, so the
+            # first key is the oldest session.
+            if len(sessions) >= MAX_SESSIONS:
+                oldest_id = next(iter(sessions))
+                sessions.pop(oldest_id, None)
+                logger.info(
+                    "Evicted oldest session '%s' (cap %s).",
+                    oldest_id, MAX_SESSIONS,
+                )
+
             sessions[session_id] = {
                 "session": ConversationSession(),
                 "engine": AdaptiveInvestigationEngine(),
@@ -866,6 +1118,25 @@ def analyze(request: InvestigationRequest):
         state_data["report"] = report_result
 
         # --------------------------------------------------
+        # 5b. Best-effort export to the connected Google apps
+        # --------------------------------------------------
+        # Only runs when Drive / Sheets report a genuine, health-verified
+        # session; otherwise each app is reported as "skipped". Failures
+        # are logged and never break the investigation.
+
+        archive_result = EvidenceArchiver().export(
+            case_id=session_id,
+            investigation=investigation_result,
+            report=report_result,
+            drive_file_id=state_data.get("drive_file_id"),
+        )
+
+        state_data["drive_file_id"] = (
+            archive_result["google_drive"].get("file_id")
+            or state_data.get("drive_file_id")
+        )
+
+        # --------------------------------------------------
         # 6. Construct final output JSON (UI-shaped payload)
         # --------------------------------------------------
 
@@ -873,7 +1144,8 @@ def analyze(request: InvestigationRequest):
 
         progress_list = build_progress(
             investigation_result,
-            engine_state
+            engine_state,
+            has_report=state_data.get("report") is not None
         )
 
         evidence_list = build_evidence(
@@ -991,7 +1263,10 @@ def analyze(request: InvestigationRequest):
             "report": {
                 "title": report_result.title,
                 "markdown": report_result.markdown
-            }
+            },
+
+            # Honest per-app export outcome for this turn (Drive/Sheets).
+            "archive": archive_result
         }
 
     except Exception as e:

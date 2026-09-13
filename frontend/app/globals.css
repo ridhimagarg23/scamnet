@@ -10,6 +10,8 @@
    4. Per-panel styles (Persona / Chat / Overview + modals)
    5. Utilities (.text-brand, .mb-2, ioc-highlight, badges)
    6. Connected Apps / Integrations modal (.integ-*)
+     (Telegram / Google Sheets / Google Drive / Gmail cards with honest
+      backend-reported status, connection info and setup instructions)
 */
 
 /* ═══════════════════════════════════════════
@@ -2387,6 +2389,11 @@ body.dark .bsb-text {
   color: #D97706;
 }
 
+.integ-icon.gmail {
+  background: #FEE2E2;
+  color: #DC2626;
+}
+
 /* Per-app icon accents (dark theme) */
 body.dark .integ-icon.telegram {
   background: rgba(56, 189, 248, 0.14);
@@ -2401,6 +2408,11 @@ body.dark .integ-icon.google_sheets {
 body.dark .integ-icon.google_drive {
   background: rgba(245, 158, 11, 0.14);
   color: #FBBF24;
+}
+
+body.dark .integ-icon.gmail {
+  background: rgba(239, 68, 68, 0.14);
+  color: #F87171;
 }
 
 .integ-main {
@@ -2543,6 +2555,47 @@ body.dark .integ-icon.google_drive {
   cursor: not-allowed;
 }
 
+/* Server-reported, secret-free facts about a live session */
+.integ-connection-info {
+  font-size: 10.5px;
+  color: var(--text-4);
+  margin-top: 6px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+/* Collapsible "what to put in the server .env" guidance, rendered from
+   the backend's setup_instructions for every not-yet-connected app. */
+.integ-setup {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.integ-setup summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--brand-mid);
+}
+
+.integ-setup p {
+  margin-top: 6px;
+  line-height: 1.55;
+  color: var(--text-4);
+}
+
+.integ-disconnect-btn {
+  margin-left: 8px;
+  white-space: nowrap;
+  font-size: 11px;
+  padding: 5px 10px;
+}
+
+.integ-disconnect-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 /* Replaces the Connect button ONLY when the server reports a real,
    health-verified authenticated session */
 .integ-connected-chip {
@@ -2570,4 +2623,78 @@ body.dark .integ-icon.google_drive {
   font-size: 10.5px;
   color: var(--text-4);
   line-height: 1.5;
+}
+
+/* Telegram reply-loop panel inside the Telegram card.
+   A connected bot that is not polling answers nothing, so this panel
+   shows the loop's honest state (running / stopped / unknown) plus
+   Start / Stop / test-hello controls. */
+.integ-loop {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.integ-loop-status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-2);
+  margin: 0;
+}
+
+.integ-loop-stats {
+  font-size: 10.5px;
+  color: var(--text-4);
+  margin: 0;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.integ-loop-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.integ-loop-btn {
+  font-size: 10.5px;
+  padding: 5px 9px;
+}
+
+.integ-loop-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.integ-loop-input {
+  width: 96px;
+  font-size: 11px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--text-1);
+}
+
+.integ-loop-hint {
+  font-size: 10px;
+  color: var(--text-4);
+  line-height: 1.6;
+  margin: 0;
+}
+
+.integ-loop-hint code {
+  font-size: 10px;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--border-light);
 }

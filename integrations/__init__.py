@@ -14,6 +14,7 @@ Registered providers
 * ``telegram``      - communication & intelligence gathering
 * ``google_sheets`` - live investigation evidence
 * ``google_drive``  - investigation reports
+* ``gmail``         - evidence inbox & report delivery
 
 Honest-status guarantee
 -----------------------
@@ -37,6 +38,7 @@ from .base import (
 from .telegram import TelegramIntegration
 from .google_sheets import GoogleSheetsIntegration
 from .google_drive import GoogleDriveIntegration
+from .gmail import GmailIntegration
 
 
 # --------------------------------------------------
@@ -60,6 +62,7 @@ def _register(integration: BaseIntegration) -> BaseIntegration:
 _register(TelegramIntegration(settings))
 _register(GoogleSheetsIntegration(settings))
 _register(GoogleDriveIntegration(settings))
+_register(GmailIntegration(settings))
 
 
 # --------------------------------------------------
@@ -97,6 +100,7 @@ __all__ = [
     "TelegramIntegration",
     "GoogleSheetsIntegration",
     "GoogleDriveIntegration",
+    "GmailIntegration",
     "get_integration",
     "get_all_integration_statuses",
 ]

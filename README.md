@@ -1,6 +1,6 @@
 # 🛡️ TraceAI — Undercover Scam Investigation Dashboard
 
-> **TraceAI** is a production-ready, AI-driven scam-investigation platform. It runs an **automated undercover agent** that talks to online scammers, extracts **Indicators of Compromise (IOCs)**, scores risk, and compiles detailed incident reports for security analysts.
+> **TraceAI** is an AI-driven scam-investigation platform: an **automated undercover agent** talks to online scammers, extracts **Indicators of Compromise (IOCs)**, scores risk and compiles detailed incident reports for security analysts. It also integrates with the analyst's real tooling over **Telegram, Google Sheets, Google Drive and Gmail**.
 
 ---
 
@@ -46,6 +46,8 @@ The analyst stays completely safe: no real personal data is ever used, and the L
 | **Markdown Report Generation** | Structured security-intelligence reports, previewed & downloadable |
 | **Dark / Light Theme** | Full UI theming via CSS variables |
 | **Session Continuity** | Multi-turn conversation state keyed by `session_id` |
+| **Live Telegram Engagement** | The undercover persona answers real Telegram messages (long-polling worker) |
+| **Evidence Archive** | Finished reports are pushed to Google Drive and case rows upserted into Google Sheets |
 
 ---
 
@@ -150,7 +152,15 @@ TraceAI/
 │   ├── conversation_agent.py    # step 2: decoy reply
 │   └── report_agent.py          # step 3: markdown report
 ├── backend/
-│   └── api.py               # FastAPI app (POST /analyze, /new, /health)
+│   ├── api.py               # FastAPI app (POST /analyze, /new, /health, /api/integrations)
+│   └── telegram_routes.py   # Telegram test + conversation endpoints
+├── integrations/            # external apps (honest connect/status layer)
+│   ├── base.py              # BaseIntegration contract + honest status payloads
+│   ├── google_api.py        # shared Google OAuth + REST plumbing
+│   ├── telegram/            # Telegram Bot API (getMe / getUpdates / sendMessage)
+│   ├── google_sheets/       # live investigation evidence (values.append / upsert)
+│   ├── google_drive/        # investigation reports (markdown upload/update)
+│   └── gmail/               # evidence inbox + report delivery
 ├── tools/                   # deterministic engines (no LLM)
 │   ├── adaptive_investigation_engine.py  # persona + objective brain
 │   ├── entity_extractor.py  # regex IOC extraction
@@ -158,6 +168,9 @@ TraceAI/
 │   ├── url_checker.py       # URL structural signals
 │   ├── memory_manager.py    # JSON archive (database/threat_memory.json)
 │   ├── conversation_session.py   # chat transcript per session
+│   ├── conversation_service.py   # Telegram <-> agent loop (per chat)
+│   ├── telegram_conversation_worker.py  # background polling worker
+│   ├── evidence_archive.py  # best-effort Drive/Sheets export
 │   └── prompt_loader.py     # loads prompts/*.txt
 ├── llm/
 │   └── llm_client.py        # single OpenRouter/OpenAI wrapper
@@ -188,7 +201,8 @@ TraceAI/
 | **Backend** | Python 3.10+, FastAPI, Uvicorn |
 | **Frontend** | Next.js 14 (React 18), vanilla CSS with CSS variables, `marked` |
 | **AI / LLM** | OpenAI SDK → **OpenRouter** gateway (`qwen/qwen3-32b` default) |
-| **Data / Persistence** | Pydantic v2 models; JSON-file memory (`database/threat_memory.json`) |
+| **Data / Persistence** | Pydantic v2 models; JSON-file memory (`database/threat_memory.json`); Google Sheets/Drive via REST |
+| **Integrations** | Telegram Bot API, Google OAuth 2.0 (`google-auth`) + REST (Drive / Sheets / Gmail) |
 | **Testing** | Python `unittest` with mocked LLM (offline) |
 
 ---
@@ -202,55 +216,119 @@ cp .env.example .env
 ```
 
 ```env
-# Required — get one at https://openrouter.ai/keys
+# LLM — get one at https://openrouter.ai/keys
 OPENROUTER_API_KEY=your-openrouter-api-key
 
 # Optional — defaults to qwen/qwen3-32b
 LLM_MODEL=qwen/qwen3-32b
+
+# Optional — extra browser origins allowed to call the API cross-origin
+CORS_ALLOW_ORIGINS=https://my-dashboard.example
+
+# Optional — external apps (see .env.example for the full reference)
+TELEGRAM_BOT_TOKEN=123456:ABC...
+GOOGLE_CREDENTIALS_FILE=/etc/scamnet/google-credentials.json
+GOOGLE_SHEETS_SPREADSHEET_ID=1AbC...
+GOOGLE_DRIVE_FOLDER_ID=1XyZ...
 ```
 
-> ⚠️ **Tests:** the unit suite mocks the LLM but `config.py` still validates the key at import time. Run tests with a dummy value: `OPENROUTER_API_KEY=test-key python -m unittest discover -s tests`.
+> ℹ️ **A missing `OPENROUTER_API_KEY` no longer stops the server.** The API boots,
+> `GET /health` reports `{"status": "degraded", "llm_configured": false}` and
+> `POST /analyze` answers HTTP **503 `llm_not_configured`** — so you can verify the
+> Telegram/Google setup first. Set `TRACEAI_STRICT_CONFIG=1` to fail fast instead.
+
+> ⚠️ **Tests:** the unit suite mocks the LLM. Run it with a dummy key:
+> `OPENROUTER_API_KEY=test-key python -m unittest discover -s tests`.
 
 ---
 
 ## 🚀 Getting Started
+
+> **TL;DR:** after the one-time setup below, run everything with
+> **`python scripts/run_all.py`** (Windows: double-click `run_all.bat`).
 
 ### Prerequisites
 - Python 3.10+
 - Node 18+ (for the dashboard)
 - Git
 
-### 1. Clone & configure
+### 1. Clone & configure (once)
 
 ```bash
 git clone <repo-url>
 cd TraceAI
 
-python3 -m venv venv
-source venv/bin/activate          # Windows: venv\Scripts\activate
+python3 -m venv .venv
+source .venv/bin/activate         # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env              # then add your OpenRouter key
+
+cp .env.example .env              # Windows: copy .env.example .env
+# then put your keys in .env (see below)
 ```
 
-### 2. Run the backend
+`.env` lives **at the repository root** (next to `config.py`) and is git-ignored.
+The two keys that matter:
+
+| Variable | What it enables | Where to get it |
+|---|---|---|
+| `OPENROUTER_API_KEY` | the AI agents (`/analyze`, Telegram replies, reports) | https://openrouter.ai/keys |
+| `TELEGRAM_BOT_TOKEN` | the Telegram bot | Telegram → **@BotFather** → `/newbot` |
+
+Without the LLM key the server still boots and serves the dashboard and the
+integrations page (`/health` reports `degraded`, agent endpoints answer `503`).
+`TELEGRAM_API_BASE` stays **empty** for real Telegram (it only exists to point at
+`scripts/telegram_simulator.py`). The dashboard needs no keys - it talks to the
+backend through the same-origin `/backend-api` proxy.
+
+### 2. Run the whole project
 
 ```bash
-python -m backend.api
-# FastAPI server on http://127.0.0.1:8001
+python scripts/run_all.py          # backend + dashboard
 ```
 
-### 3. Run the frontend dashboard
+Windows users can double-click **`run_all.bat`**; Linux/macOS: **`./run_all.sh`**.
+Both accept the same flags:
 
-```bash
-cd frontend
-npm install
-npm run dev
-# Dashboard on http://127.0.0.1:3000
+| Flag | Effect |
+|---|---|
+| `--streamlit` | also start the Streamlit UI on `:8501` |
+| `--no-frontend` | backend only (no Node needed) |
+| `--reload` | restart the backend when Python files change |
+| `--backend-port N` / `--frontend-port N` | use other ports (default `8001` / `3000`) |
+| `--skip-install` | never run `npm install` |
+
+The launcher prints a readiness report (missing keys, degraded mode), installs
+dashboard dependencies the first time, waits until each service really answers,
+prefixes every log line (`[api]`, `[ui]`, `[streamlit]`) and stops everything on
+**Ctrl+C**.
+
 ```
+  Dashboard      : http://localhost:3000
+  Backend API    : http://localhost:8001
+  Health check   : http://localhost:8001/health
+  Telegram status: http://localhost:8001/api/telegram/conversation/status
+```
+
+### 3. Use it
+
+Open the dashboard, click the **paste-template** icon (or type a scam SMS such as
+*"Dear SBI customer, your card is blocked. Verify at http://sbi-secure-login.co.in"*)
+and press **Send**.
+
+With `TELEGRAM_BOT_TOKEN` set, the bot connects **and starts replying on boot** -
+check **Connected Apps → Telegram** in the dashboard (the card shows the loop
+running, with Start/Stop and a "send test hello" box), or message the bot from
+Telegram: `/start` gets an instant greeting, any other message gets investigated
+and answered by the persona.
 
 Open the dashboard, click the **paste-template** icon (or type a scam SMS such as *"Dear SBI customer, your card is blocked. Verify at http://sbi-secure-login.co.in"*) and press **Send**.
 
-> ℹ️ The dashboard calls the backend at `http://127.0.0.1:8001` automatically when served from `localhost`. For other hosts set `NEXT_PUBLIC_API_URL`.
+> ℹ️ The dashboard talks to the backend **same-origin** through the Next.js
+> `/backend-api` proxy, so it works on localhost, on Vercel and behind any reverse
+> proxy. Point the proxy at your backend with `BACKEND_INTERNAL_URL`
+> (`frontend/.env.local` for dev, project env for Vercel); `NEXT_PUBLIC_API_URL`
+> remains available if you prefer direct browser→API calls (then the backend's
+> `CORS_ALLOW_ORIGINS` must include the dashboard origin).
 
 ### CLI quick test (no browser)
 
@@ -269,7 +347,122 @@ The suite is **offline** — the LLM is patched with mocks, so no API key or net
 OPENROUTER_API_KEY=test-key python -m unittest discover -s tests -v
 ```
 
-Covers: investigation/conversation/report agents (mocked LLM), the adaptive engine's profile & objective flow, and memory save/load/search/clear.
+Covers: investigation/conversation/report agents (mocked LLM), the adaptive engine's profile & objective flow,
+memory save/load/search/clear, the Telegram Bot API client + conversation worker (stub HTTP) and the Google
+Drive/Sheets/Gmail clients (credentials → token refresh → authorized call → upload/upsert, all offline).
+
+---
+
+## 🔌 SCAMNET Integrations (Telegram / Sheets / Drive / Gmail)
+
+The dashboard's **Connected Apps** modal (sidebar → *Connected Apps*) reports the
+**real** server-side state of four external apps. Every app implements a genuine
+authentication handshake — nothing is ever shown as "connected" unless the remote
+service itself accepted the credentials.
+
+| App | Role | What `Connect` actually does | Required server-side settings |
+|---|---|---|---|
+| **Telegram** | Communication & intelligence gathering | `getMe` verifies the bot token and returns the bot identity | `TELEGRAM_BOT_TOKEN` |
+| **Google Sheets** | Live investigation evidence | Reads the target spreadsheet, or **creates** `SCAMNET Investigation Evidence` when no id is set, then guarantees the `Evidence` tab | `GOOGLE_SHEETS_CREDENTIALS_FILE` *(or `GOOGLE_CREDENTIALS_FILE`)*, optional `GOOGLE_SHEETS_SPREADSHEET_ID`, `GOOGLE_SHEETS_WORKSHEET` |
+| **Google Drive** | Investigation reports | `about.get` verifies the account and the destination folder | `GOOGLE_DRIVE_CREDENTIALS_FILE` *(or `GOOGLE_CREDENTIALS_FILE`)*, optional `GOOGLE_DRIVE_FOLDER_ID` |
+| **Gmail** | Evidence inbox & report delivery | `users.getProfile` verifies the mailbox | `GOOGLE_GMAIL_CREDENTIALS_FILE` *(or `GOOGLE_CREDENTIALS_FILE`)* |
+
+### Google credentials in 4 steps
+
+1. Create a Google Cloud project and enable the **Drive API**, **Sheets API**
+   and/or **Gmail API**.
+2. Create a **service account** (Drive/Sheets) and download its JSON key, *or* run
+   the OAuth consent flow for the mailbox and save the resulting
+   `authorized_user` JSON (required for Gmail).
+3. Put the file on the server (git-ignored) and set `GOOGLE_CREDENTIALS_FILE`
+   — or the provider-specific variable — to its path in `.env`.
+4. For a **service account**, share the Drive folder / spreadsheet with the
+   account's `client_email` (**Editor**). Restart the backend, open *Connected
+   Apps* and press **Connect**: the server tells you exactly what failed
+   (`409` credentials missing/invalid, `502` Google refused the credentials).
+
+> 🔐 Secrets never reach the browser: `GET /api/integrations` returns only
+> *whether* settings exist, a human-readable state, and secret-free facts about a
+> live session (bot username, Google account, spreadsheet id). Credentials-file
+> paths and tokens are redacted from every log line, error message and response.
+
+### Integration endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/integrations` | Honest status of all four apps (never a fake connection) |
+| `POST /api/integrations/{id}/connect` | Real handshake: `200` connected · `409` not configured · `502` attempt failed |
+| `POST /api/integrations/{id}/disconnect` | Drops the live session without touching credentials |
+| `GET /health` | Liveness + `llm_configured` (reports `degraded` without an LLM key) |
+| `GET /api/telegram/messages` · `POST /api/telegram/send-test` | Telegram communication test endpoints |
+| `POST /api/telegram/conversation/start` · `/stop` | Start/stop the background reply loop (long-polling worker) |
+| `POST /api/telegram/conversation/fetch` | Poll **once** and answer everything - the same loop for hosts that cannot keep a thread alive (cron / uptime pinger) |
+| `POST /api/telegram/conversation/wake` | Send the liveness greeting to one chat - proves the outbound path with no LLM |
+| `POST /api/telegram/conversation/message` · `GET /status` · `POST /reset` · `GET /commands` | Manual turn, honest loop+chat state, per-chat reset, bot commands |
+
+When Drive/Sheets are connected, each `POST /analyze` turn also **archives the
+case** (report uploaded/updated in Drive, case row upserted in Sheets). The
+response carries an `archive` field with the per-app outcome; archiving is
+best-effort and never breaks an investigation.
+
+### Attaching the persona to a live scammer
+
+1. Set `TELEGRAM_BOT_TOKEN` (from @BotFather) and restart the backend.
+2. Connect Telegram in the dashboard, or `POST /api/integrations/telegram/connect`.
+   The connect step **verifies the token with `getMe`, clears any webhook that
+   would block `getUpdates`, publishes the `/start` command and starts the reply
+   loop** - all in one call. (Set `TELEGRAM_AUTO_START_WORKER=0` to keep the loop
+   manual.)
+3. Every inbound message is investigated and answered by the undercover persona
+   automatically; the reply is length-checked in Telegram's own unit (UTF-16 code
+   units) and retried once if Telegram rate-limits it (HTTP 429).
+4. Watch it with `GET /api/telegram/conversation/status` (polls, answered,
+   greetings, last poll, last error), stop it with `/stop`, and reset one chat
+   with `/reset`.
+
+**How the bot behaves**
+
+| Message | What happens |
+|---|---|
+| any text | investigation + persona reply (needs the LLM key) |
+| `/start` · `/START` · `/start@your_bot` | fixed greeting, **no LLM needed**, never opens a case |
+| photo / sticker / voice / edit / channel post | ignored safely (never crashes the loop) |
+
+**Delivery models** - both use one shared worker and can never poll at the same
+time, so a message is never answered twice:
+
+* **push** - `/conversation/start` long-polls on a background thread (default,
+  replies in seconds). Best on Render/Railway/a VPS.
+* **fetch** - call `POST /api/telegram/conversation/fetch` from cron / an uptime
+  pinger / a GitHub Action. Identical brain; works on hosts that suspend the
+  process between requests, where a background thread would quietly stop.
+
+**Testing the bot without a real bot token**
+
+```bash
+# terminal 1 - fake Telegram Bot API + fake LLM gateway
+.venv/bin/python scripts/telegram_simulator.py
+
+# terminal 2 - the REAL backend pointed at the fakes
+TELEGRAM_BOT_TOKEN="99999:SIMULATOR-TOKEN" \
+TELEGRAM_API_BASE="http://127.0.0.1:8099" \
+OPENROUTER_API_KEY="simulator-key" \
+OPENROUTER_BASE_URL="http://127.0.0.1:8098/v1" \
+.venv/bin/uvicorn backend.api:app --port 8001
+
+# terminal 3 - the "scammer" writes to the bot, then read what it answered
+curl -X POST http://127.0.0.1:8099/_push -H 'Content-Type: application/json' \
+     -d '{"chat_id": 424242, "text": "Your card is blocked, verify now"}'
+curl http://127.0.0.1:8099/_state
+```
+
+`scripts/e2e_telegram_check.py` automates exactly that against the real HTTP
+API (connect -> auto-start -> message in -> persona reply out -> second turn ->
+`/start` -> stop -> fetch mode -> disconnect) and exits non-zero on any failure:
+
+```bash
+.venv/bin/python scripts/e2e_telegram_check.py
+```
 
 ---
 
@@ -283,19 +476,33 @@ Covers: investigation/conversation/report agents (mocked LLM), the adaptive engi
 
 ### Frontend (Vercel)
 1. Deploy the `frontend/` directory as a Next.js app.
-2. Set `NEXT_PUBLIC_API_URL` to your deployed backend URL.
-3. In `backend/api.py` add your frontend origin to the CORS allow-list.
+2. Set `BACKEND_INTERNAL_URL` to your deployed backend URL (e.g.
+   `https://traceai-backend-rg.up.railway.app`). The Next server proxies
+   `/backend-api/*` to it, so the browser stays same-origin and no CORS entry is
+   needed.
+3. Only if you call the API **directly** from the browser (rather than through the
+   proxy): set `NEXT_PUBLIC_API_URL` on the frontend and add that origin to
+   `CORS_ALLOW_ORIGINS` on the backend (no code edit required).
 
 ---
 
 ## ⚠️ Limitations & Roadmap
 
 - **In-memory sessions** — state resets on restart; swap in Redis for horizontal scale.
+- **Telegram loop is single-process** — one bot token polls one process. Run the
+  fetch endpoint (not `/conversation/start`) when you scale to several replicas,
+  or Telegram will answer `409` to the overlapping `getUpdates` calls.
 - **JSON-file memory** — per-run archive on ephemeral hosts; a real DB is needed for durable history.
 - **Static personas** — backend returns no avatar; the frontend maps occupations to avatar PNGs.
 - **Stub UI actions** — History / Saved Cases / Edit Persona are placeholders.
 - **India-focused extraction** — phone/UPI/bank patterns target the Indian threat landscape.
-- **CORS allow-list** — currently only the Vercel origin; extend for other frontend hosts.
+- **CORS allow-list** — configure with `CORS_ALLOW_ORIGINS`; the bundled dashboard
+  needs no entry because it proxies same-origin.
+- **Google credentials must be shared** — a service account only sees Drive files
+  and spreadsheets explicitly shared with its `client_email`; Gmail additionally
+  requires an OAuth user token (or Workspace domain-wide delegation).
+- **Integration sessions are per-process** — a restart means pressing Connect
+  again (the credentials stay configured).
 
 ---
 
