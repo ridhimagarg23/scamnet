@@ -325,10 +325,11 @@ Open the dashboard, click the **paste-template** icon (or type a scam SMS such a
 
 > ℹ️ The dashboard talks to the backend **same-origin** through the Next.js
 > `/backend-api` proxy, so it works on localhost, on Vercel and behind any reverse
-> proxy. Point the proxy at your backend with `BACKEND_INTERNAL_URL`
-> (`frontend/.env.local` for dev, project env for Vercel); `NEXT_PUBLIC_API_URL`
-> remains available if you prefer direct browser→API calls (then the backend's
-> `CORS_ALLOW_ORIGINS` must include the dashboard origin).
+> proxy. Local development defaults to `http://127.0.0.1:8001`; Vercel defaults to
+> the existing hosted Railway backend. Point the proxy at another backend with
+> `BACKEND_INTERNAL_URL` (`frontend/.env.local` for dev, project env for Vercel).
+> `NEXT_PUBLIC_API_URL` remains available for direct browser→API calls (then the
+> backend's `CORS_ALLOW_ORIGINS` must include the dashboard origin).
 
 ### CLI quick test (no browser)
 
@@ -477,7 +478,9 @@ API (connect -> auto-start -> message in -> persona reply out -> second turn ->
 ### Frontend (Vercel)
 1. Deploy the `frontend/` directory as a Next.js app.
 2. Set `BACKEND_INTERNAL_URL` to your deployed backend URL (e.g.
-   `https://traceai-backend-rg.up.railway.app`). The Next server proxies
+   `https://traceai-backend-rg.up.railway.app`). This is optional for the current
+   Vercel deployment because that URL is already the hosted fallback, but it must
+   be set for any new/different backend. The Next server proxies
    `/backend-api/*` to it, so the browser stays same-origin and no CORS entry is
    needed.
 3. Only if you call the API **directly** from the browser (rather than through the

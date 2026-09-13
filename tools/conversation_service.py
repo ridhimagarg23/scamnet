@@ -325,11 +325,12 @@ class TelegramConversationService:
 
         Returns
         -------
-        dict
+            dict
             ``chat_id``, ``reply``, ``objective``, ``expected_outcome``,
-            ``is_scam``, ``confidence``, ``threat_type``, ``risk_score``,
-            ``risk_level``, ``strategy``, ``current_objective``,
-            ``turn``, ``sender_username``, ``message``.
+            ``objective_achieved``, ``is_scam``, ``confidence``,
+            ``threat_type``, ``risk_score``, ``risk_level``, ``strategy``,
+            ``current_objective``, ``turn``, ``sender_username``,
+            ``message``.
 
         Raises
         ------
@@ -366,14 +367,14 @@ class TelegramConversationService:
 
         else:
 
-            # LATER messages: accumulate IOCs, re-score risk and
-            # advance the objective ladder.
+            # LATER messages: accumulate IOCs and re-score risk.
+            # The objective ladder is advanced only AFTER the
+            # ConversationAgent verifies that the inbound message
+            # supplied the evidence the current objective requested.
             state.investigation = merge_investigations(
                 state.investigation, fresh
             )
-            engine_state = state.engine.update(
-                objective_completed=True
-            )
+            engine_state = state.engine.get_state()
 
         investigation = state.investigation
 
@@ -399,7 +400,19 @@ class TelegramConversationService:
             result.reply
         )
 
+        # The model is closest to the conversational semantics: the
+        # turn counter advances after every inbound message, but the
+        # evidence ladder advances ONLY when that message delivered the
+        # requested artifact. Asking for an OTP, saying "wait", or
+        # merely continuing the chat must not jump to a new objective.
         state.turn += 1
+        engine_state = state.engine.update(
+            objective_completed=result.objective_achieved
+        )
+        # Keep the engine's turn number aligned with the number of
+        # inbound messages actually handled in THIS chat.
+        engine_state.turn_number = state.turn
+
         state.last_threat_type = investigation.threat_type
         state.last_objective = engine_state.current_objective
         state.last_strategy = engine_state.current_strategy
@@ -433,6 +446,7 @@ class TelegramConversationService:
             "reply": result.reply,
             "objective": result.objective,
             "expected_outcome": result.expected_outcome,
+            "objective_achieved": result.objective_achieved,
             "is_scam": investigation.is_scam,
             "confidence": investigation.confidence,
             "threat_type": investigation.threat_type,

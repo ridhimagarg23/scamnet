@@ -76,9 +76,14 @@ class LLMClient:
                 "restart the backend to enable the AI agents."
             )
 
+        # ``max_retries=0`` is deliberate: this method owns the
+        # exponential-backoff retry policy, so stacking the SDK's
+        # retries on top would multiply slow provider outages.
         self.client = OpenAI(
             api_key=settings.OPENROUTER_API_KEY,
             base_url=settings.OPENROUTER_BASE_URL,
+            timeout=90.0,
+            max_retries=0,
         )
 
         self.model = settings.LLM_MODEL
@@ -121,6 +126,7 @@ class LLMClient:
         """
 
         last_error = None
+        request_json_mode = json_output
 
         # ----------------------------------------------------------
         # Retry loop with exponential backoff
@@ -130,16 +136,29 @@ class LLMClient:
 
             try:
 
-                # 1. Send the single-user-turn request.
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    temperature=temperature,
-                    messages=[
+                # 1. Send the single-user-turn request. Most prompts
+                # embed their own system instructions for provider
+                # compatibility. When structured output is requested,
+                # also ask OpenAI-compatible gateways that support it
+                # to constrain the response to JSON.
+                request_kwargs: dict[str, Any] = {
+                    "model": self.model,
+                    "temperature": temperature,
+                    "messages": [
                         {
                             "role": "user",
                             "content": prompt,
                         }
                     ],
+                }
+
+                if request_json_mode:
+                    request_kwargs["response_format"] = {
+                        "type": "json_object"
+                    }
+
+                response = self.client.chat.completions.create(
+                    **request_kwargs
                 )
 
                 # 2. Read the generated text.
@@ -155,7 +174,7 @@ class LLMClient:
                 if not json_output:
                     return text
 
-                return json.loads(text)
+                return self._parse_json(text)
 
             # A JSONDecodeError is a *content* bug (bad model output),
             # not a network blip -> fail fast with a helpful message.
@@ -170,6 +189,23 @@ class LLMClient:
             except Exception as e:
 
                 last_error = e
+
+                # Some self-hosted OpenAI-compatible gateways do not
+                # implement response_format. Retry immediately without it
+                # once instead of failing the whole structured agent.
+                error_text = str(e).lower()
+                unsupported_json_mode = (
+                    "response_format" in error_text
+                    or "response format" in error_text
+                )
+
+                if (
+                    json_output
+                    and request_json_mode
+                    and unsupported_json_mode
+                ):
+                    request_json_mode = False
+                    continue
 
                 if attempt == retries - 1:
                     break
@@ -187,6 +223,36 @@ class LLMClient:
         raise RuntimeError(
             f"LLM request failed.\n\n{last_error}"
         )
+
+    @classmethod
+    def _parse_json(cls, text: str) -> dict[str, Any]:
+        """
+        Parse a model response that is supposed to be a JSON object.
+
+        Models are explicitly told to return JSON, but chat models
+        occasionally add a short note or code fence despite that
+        instruction. The parser first tries the complete cleaned text,
+        then the outermost ``{...}`` span, while still rejecting a
+        response that does not contain one valid JSON object.
+        """
+
+        cleaned = cls._clean_response(text)
+
+        try:
+            parsed = json.loads(cleaned)
+        except json.JSONDecodeError:
+            start = cleaned.find("{")
+            end = cleaned.rfind("}")
+
+            if start == -1 or end <= start:
+                raise
+
+            parsed = json.loads(cleaned[start:end + 1])
+
+        if not isinstance(parsed, dict):
+            raise ValueError("LLM returned JSON that is not an object.")
+
+        return parsed
 
     @staticmethod
     def _clean_response(text: str) -> str:
