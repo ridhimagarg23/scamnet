@@ -94,6 +94,14 @@ external app in the honest "not_configured" state):
 * ``GOOGLE_DRIVE_FOLDER_ID``        - Optional report destination folder.
 * ``GOOGLE_GMAIL_CREDENTIALS_FILE`` - Server-side path to the Gmail
                                       authorized-user JSON key.
+* ``GOOGLE_GMAIL_REPORT_RECIPIENTS``- Comma-separated addresses that
+                                      receive the finished report
+                                      e-mail (empty = no auto delivery).
+* ``GOOGLE_GMAIL_REPORT_SUBJECT_PREFIX``
+                                    - Subject prefix of that e-mail.
+* ``GOOGLE_GMAIL_SEND_EVERY_TURN``  - 1 = e-mail the report on every
+                                      /analyze turn; 0 (default) = only
+                                      the first time a case produces one.
 
 Example
 -------
@@ -228,6 +236,37 @@ def _env_list(*names: str) -> list:
             ]
 
     return []
+
+
+def _parse_email_list(raw: str | None) -> list:
+    """
+    Parse a comma/semicolon/space-separated list of e-mail addresses.
+
+    Used for ``GOOGLE_GMAIL_REPORT_RECIPIENTS``. Obvious junk (entries
+    without ``@``) is dropped so a typo cannot make every report
+    delivery fail; the SMTP server remains the real authority. Order is
+    preserved and duplicates removed.
+    """
+
+    if not raw or not raw.strip():
+        return []
+
+    import re
+
+    seen = set()
+    result = []
+
+    for item in re.split(r"[,;\s]+", raw.strip()):
+        address = item.strip()
+        if not address or "@" not in address:
+            continue
+        lowered = address.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        result.append(address)
+
+    return result
 
 
 def _dedupe(models) -> list:
@@ -480,9 +519,18 @@ class Settings:
         # as honest status - never as values - by GET /api/integrations.
         # A missing variable simply keeps that integration in the
         # "not_configured" state; nothing fails at startup because of
-        # them. Real authentication flows are not implemented yet:
-        # see the "To implement the real flow later" docstring section
-        # in each integrations/<provider>/client.py.
+        # them. Every provider implements a REAL authentication flow
+        # (see integrations/google_api.py and integrations/telegram).
+        #
+        # What happens once they are connected (the "workflow"):
+        #   * google_sheets - one row per case (upserted by case_id) in
+        #     the evidence worksheet, written on every /analyze turn;
+        #   * google_drive  - the markdown report is uploaded once and
+        #     then UPDATED in place on later turns (one artefact/case);
+        #   * gmail         - the finished report is e-mailed to
+        #     GOOGLE_GMAIL_REPORT_RECIPIENTS (once per case by default);
+        #   * telegram      - the reply loop answers the scammer live.
+        # See tools/evidence_archive.py + docs/GOOGLE_SETUP.md.
         #
         # SECURITY: these credentials must only ever live in the
         # server-side .env (git-ignored). They must never be sent to
@@ -536,6 +584,29 @@ class Settings:
         # service accounts require Workspace domain-wide delegation.
         self.GOOGLE_GMAIL_CREDENTIALS_FILE = os.getenv(
             "GOOGLE_GMAIL_CREDENTIALS_FILE"
+        )
+
+        # Comma-separated addresses that receive the finished report
+        # e-mail (e.g. "soc@company.com,analyst@gmail.com"). Empty =
+        # no automatic delivery; the report can still be sent on demand
+        # through POST /api/integrations/gmail/send-report.
+        self.GOOGLE_GMAIL_REPORT_RECIPIENTS = _parse_email_list(
+            os.getenv("GOOGLE_GMAIL_REPORT_RECIPIENTS", "")
+        )
+
+        # Subject prefix of the report e-mail.
+        self.GOOGLE_GMAIL_REPORT_SUBJECT_PREFIX = os.getenv(
+            "GOOGLE_GMAIL_REPORT_SUBJECT_PREFIX",
+            "[TraceAI] Scam Investigation Report"
+        ).strip() or "[TraceAI] Scam Investigation Report"
+
+        # Send the report e-mail on EVERY /analyze turn (1) or only the
+        # first time a case produces a report (0, default). Multi-turn
+        # investigations re-generate the report each turn, so the
+        # default keeps the inbox clean - the Drive file is updated in
+        # place anyway, and the e-mail carries its link.
+        self.GOOGLE_GMAIL_SEND_EVERY_TURN = _env_flag(
+            "GOOGLE_GMAIL_SEND_EVERY_TURN", False
         )
 
         # ------------------------------------------------------

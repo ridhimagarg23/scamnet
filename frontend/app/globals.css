@@ -654,6 +654,50 @@ body.dark .nav-item:hover {
   width: 100%;
 }
 
+/* Pulsing skeleton placeholders shown before a persona is assigned.
+   Without explicit size + background these divs collapse to 0x0 and
+   the "Waiting for Persona" state renders blank, so they are defined
+   here (the JSX only sets margin/width inline). */
+.skeleton-avatar {
+  width: 90px;
+  height: 90px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: linear-gradient(
+    100deg,
+    var(--border-light) 30%,
+    var(--bg) 50%,
+    var(--border-light) 70%
+  );
+  background-size: 220% 100%;
+  animation: skeleton-shimmer 1.4s ease-in-out infinite;
+}
+
+.skeleton-text {
+  height: 11px;
+  border-radius: 6px;
+  background: linear-gradient(
+    100deg,
+    var(--border-light) 30%,
+    var(--bg) 50%,
+    var(--border-light) 70%
+  );
+  background-size: 220% 100%;
+  animation: skeleton-shimmer 1.4s ease-in-out infinite;
+}
+
+@keyframes skeleton-shimmer {
+  0%   { background-position: 180% 0; }
+  100% { background-position: -80% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton-avatar,
+  .skeleton-text {
+    animation: none;
+  }
+}
+
 .persona-real-content {
   display: flex;
   flex-direction: column;
@@ -691,6 +735,18 @@ body.dark .nav-item:hover {
 
 .persona-avatar svg.avatar-svg-el,
 .persona-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 50%;
+  display: block;
+}
+
+/* Base rule for the PNG avatars rendered by Avatar.jsx (scammer +
+   persona). The component also sets these inline, but defining the
+   hook here keeps every avatar round/cover-filled even if a caller
+   forgets the inline style, and mirrors svg.avatar-svg-el above. */
+.avatar-img-el {
   width: 100%;
   height: 100%;
   object-fit: cover;
@@ -774,6 +830,13 @@ body.dark .nav-item:hover {
   grid-template-columns: 18px 1fr;
   gap: 8px;
   align-items: center;
+}
+
+.trait-content {
+  /* Second grid column of .trait-row; min-width:0 lets long values
+     (e.g. a full objective sentence) wrap instead of overflowing the
+     fixed 18px-icon + 1fr grid. */
+  min-width: 0;
 }
 
 .trait-icon {
@@ -1134,6 +1197,20 @@ body.dark .text-brand {
   height: 100%;
   object-fit: cover;
   display: block;
+}
+
+/* Semantic avatar hooks (used alongside .msg-avatar in ChatPanel):
+   the scammer's bubble gets a danger-tinted ring, the persona's a
+   brand-tinted one, so the two sides are distinguishable at a glance
+   even before reading the sender label. */
+.msg-avatar.scammer-av {
+  border-color: var(--danger-border);
+  box-shadow: 0 0 0 2px var(--danger-bg);
+}
+
+.msg-avatar.user-av {
+  border-color: var(--brand);
+  box-shadow: 0 0 0 2px var(--brand-light);
 }
 
 .msg-bubble-wrap {
@@ -1559,6 +1636,16 @@ body.dark .bsb-text {
   flex-direction: column;
   gap: 4px;
   min-width: 0;
+}
+
+/* Icon wrapper beside the Threat Level readout (OverviewPanel.jsx).
+   Sized/coloured inline, defined here so the hook is not dead CSS. */
+.risk-icon-wrap {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--danger);
+  flex-shrink: 0;
 }
 
 .risk-lbl {

@@ -44,7 +44,7 @@ import datetime
 import logging
 import time
 import traceback
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -195,6 +195,19 @@ class LLMSelectRequest(BaseModel):
 
     model: Optional[str] = None
     """Model id to activate (defaults to the provider's default)."""
+
+
+class GmailReportRequest(BaseModel):
+    """Request body for POST /api/integrations/gmail/send-report."""
+
+    session_id: str
+    """The case whose stored report should be e-mailed."""
+
+    to: Optional[List[str]] = None
+    """
+    Optional recipient override. When omitted, the server-side
+    ``GOOGLE_GMAIL_REPORT_RECIPIENTS`` list is used.
+    """
 
 
 # --------------------------------------------------
@@ -1031,6 +1044,96 @@ def integrations_disconnect(integration_id: str):
     return payload
 
 
+@app.post("/api/integrations/gmail/send-report")
+def gmail_send_report(request: GmailReportRequest):
+    """
+    E-mail a finished case report ON DEMAND (outside the /analyze turn).
+
+    Uses the report already stored for ``session_id`` (the same one the
+    Drive/Sheets workflow archives). Honest outcomes:
+      404 - the session has no stored report yet
+      409 - Gmail is not connected / no recipients configured
+      502 - Gmail rejected the send
+      200 - the report was delivered (recipients echoed back)
+
+    Recipients default to the server-side
+    ``GOOGLE_GMAIL_REPORT_RECIPIENTS``; pass ``to`` to override.
+    """
+
+    gmail = get_integration("gmail")
+
+    if gmail is None or not gmail.is_connected():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "status": "gmail_not_connected",
+                "message": (
+                    "Gmail is not connected. Configure "
+                    "GOOGLE_GMAIL_CREDENTIALS_FILE (an authorized-user "
+                    "JSON), restart the backend, then Connect it in the "
+                    "dashboard's Connected Apps modal."
+                ),
+            },
+        )
+
+    state_data = sessions.get(request.session_id)
+    report = (state_data or {}).get("report")
+
+    if report is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "status": "no_report",
+                "message": (
+                    f"No report is stored for session '{request.session_id}'. "
+                    "Run POST /analyze for this session first."
+                ),
+            },
+        )
+
+    recipients = request.to or settings.GOOGLE_GMAIL_REPORT_RECIPIENTS
+
+    if not recipients:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "status": "no_recipients",
+                "message": (
+                    "No recipients. Set GOOGLE_GMAIL_REPORT_RECIPIENTS in "
+                    "the server-side .env, or pass 'to' in the request."
+                ),
+            },
+        )
+
+    archiver = EvidenceArchiver()
+    result = archiver.send_report(
+        case_id=request.session_id,
+        investigation=(state_data or {}).get("investigation"),
+        report=report,
+        recipients=list(recipients),
+        drive_link=(state_data or {}).get("drive_link"),
+    )
+
+    if result.get("status") == "sent":
+        logger.info(
+            "Report e-mailed for session '%s' to %s.",
+            request.session_id, result.get("recipients"),
+        )
+        return result
+
+    if result.get("status") == "failed":
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"status": "send_failed", "message": result.get("reason")},
+        )
+
+    # skipped (no_report / not_connected / no_recipients) - be explicit.
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"status": result.get("status"), "message": result.get("reason")},
+    )
+
+
 @app.options("/new")
 def new_options():
     logger.info("Received OPTIONS request for /new preflight")
@@ -1161,7 +1264,10 @@ def analyze(request: InvestigationRequest):
                 "report": None,
                 "persona_profile": None,
                 "timeline": [],
-                "turn_count": 0
+                "turn_count": 0,
+                "drive_file_id": None,
+                "drive_link": None,
+                "report_emailed": False
             }
 
         state_data = sessions[session_id]
@@ -1482,6 +1588,7 @@ def analyze(request: InvestigationRequest):
             investigation=investigation_result,
             report=report_result,
             drive_file_id=state_data.get("drive_file_id"),
+            report_already_emailed=bool(state_data.get("report_emailed")),
         )
         _log_stage(session_id, "archive", stage_started)
 
@@ -1489,6 +1596,18 @@ def analyze(request: InvestigationRequest):
             archive_result["google_drive"].get("file_id")
             or state_data.get("drive_file_id")
         )
+
+        # Keep the shareable Drive link so the on-demand Gmail endpoint
+        # (POST /api/integrations/gmail/send-report) can include it.
+        state_data["drive_link"] = (
+            archive_result["google_drive"].get("link")
+            or state_data.get("drive_link")
+        )
+
+        # Remember that this case's report was delivered, so later turns
+        # do not re-e-mail it (unless GOOGLE_GMAIL_SEND_EVERY_TURN=1).
+        if archive_result.get("gmail", {}).get("status") == "sent":
+            state_data["report_emailed"] = True
 
         # --------------------------------------------------
         # 6. Construct final output JSON (UI-shaped payload)
