@@ -831,6 +831,7 @@ class StubIntegration:
         self.fail = fail
         self.uploads = []
         self.upserts = []
+        self.emails = []
 
     def is_connected(self):
         return self.connected
@@ -852,10 +853,35 @@ class StubIntegration:
         self.upserts.append({"case_id": case_id, "row": row})
         return {"action": "created", "row": 2, "spreadsheet_id": "sheet-1"}
 
+    def send_email(self, to, subject, body):
+        if self.fail:
+            raise RuntimeError("gmail exploded")
+        self.emails.append({"to": to, "subject": subject, "body": body})
+        return {"id": "msg-1", "thread_id": "thread-1", "to": to}
+
+
+def make_archiver_settings(**overrides):
+    """Stub settings carrying the Gmail workflow knobs."""
+
+    base = dict(
+        GOOGLE_GMAIL_REPORT_RECIPIENTS=["soc@company.com"],
+        GOOGLE_GMAIL_REPORT_SUBJECT_PREFIX="[TraceAI] Report",
+        GOOGLE_GMAIL_SEND_EVERY_TURN=False,
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
 
 class TestEvidenceArchive(unittest.TestCase):
 
-    INVESTIGATION = {"threat_type": "Banking Phishing", "risk_score": 91}
+    INVESTIGATION = {
+        "threat_type": "Banking Phishing",
+        "risk_score": 91,
+        "risk_level": "HIGH",
+        "is_scam": True,
+        "phone_numbers": ["+919876543210"],
+        "urls": ["http://sbi-secure.co.in"],
+    }
     REPORT = {"title": "TraceAI Report", "markdown": "# report"}
 
     def test_skips_disconnected_apps(self):
@@ -915,6 +941,303 @@ class TestEvidenceArchive(unittest.TestCase):
         result = archiver.export("case-1", self.INVESTIGATION, None)
 
         self.assertEqual(result["google_drive"]["reason"], "no_report")
+
+
+class TestEvidenceArchiveGmail(unittest.TestCase):
+    """The Gmail report-delivery branch of the archiver workflow."""
+
+    INVESTIGATION = {
+        "threat_type": "Banking Phishing",
+        "risk_score": 91,
+        "risk_level": "HIGH",
+        "is_scam": True,
+        "phone_numbers": ["+919876543210"],
+        "urls": ["http://sbi-secure.co.in"],
+    }
+    REPORT = {"title": "TraceAI Report", "markdown": "# full report body"}
+
+    def _archiver(self, **settings_overrides):
+        gmail = StubIntegration()
+        archiver = EvidenceArchiver(
+            drive=StubIntegration(),
+            sheets=StubIntegration(),
+            gmail=gmail,
+            settings=make_archiver_settings(**settings_overrides),
+        )
+        return archiver, gmail
+
+    def test_sends_report_email_to_configured_recipients(self):
+        archiver, gmail = self._archiver()
+
+        result = archiver.export("case-1", self.INVESTIGATION, self.REPORT)
+
+        self.assertEqual(result["gmail"]["status"], "sent")
+        self.assertEqual(result["gmail"]["recipients"], ["soc@company.com"])
+        self.assertEqual(len(gmail.emails), 1)
+        # The Drive link is threaded into the e-mail body.
+        self.assertIn("https://x/file-1", gmail.emails[0]["body"])
+        self.assertIn("# full report body", gmail.emails[0]["body"])
+        self.assertIn("Banking Phishing", gmail.emails[0]["body"])
+
+    def test_skipped_when_disconnected(self):
+        archiver, gmail = self._archiver()
+        gmail.connected = False
+
+        result = archiver.export("case-1", self.INVESTIGATION, self.REPORT)
+
+        self.assertEqual(result["gmail"]["status"], "skipped")
+        self.assertEqual(result["gmail"]["reason"], "not_connected")
+        self.assertEqual(gmail.emails, [])
+
+    def test_skipped_when_no_recipients_configured(self):
+        archiver, gmail = self._archiver(GOOGLE_GMAIL_REPORT_RECIPIENTS=[])
+
+        result = archiver.export("case-1", self.INVESTIGATION, self.REPORT)
+
+        self.assertEqual(result["gmail"]["status"], "skipped")
+        self.assertEqual(result["gmail"]["reason"], "no_recipients")
+        self.assertEqual(gmail.emails, [])
+
+    def test_skipped_when_no_report(self):
+        archiver, gmail = self._archiver()
+
+        result = archiver.export("case-1", self.INVESTIGATION, None)
+
+        self.assertEqual(result["gmail"]["status"], "skipped")
+        self.assertEqual(result["gmail"]["reason"], "no_report")
+        self.assertEqual(gmail.emails, [])
+
+    def test_once_per_case_by_default(self):
+        archiver, gmail = self._archiver()
+
+        result = archiver.export(
+            "case-1", self.INVESTIGATION, self.REPORT,
+            report_already_emailed=True,
+        )
+
+        self.assertEqual(result["gmail"]["status"], "skipped")
+        self.assertEqual(result["gmail"]["reason"], "already_sent")
+        self.assertEqual(gmail.emails, [])
+
+    def test_send_every_turn_overrides_once_per_case(self):
+        archiver, gmail = self._archiver(GOOGLE_GMAIL_SEND_EVERY_TURN=True)
+
+        result = archiver.export(
+            "case-1", self.INVESTIGATION, self.REPORT,
+            report_already_emailed=True,
+        )
+
+        self.assertEqual(result["gmail"]["status"], "sent")
+        self.assertEqual(len(gmail.emails), 1)
+
+    def test_multiple_recipients_all_receive_the_report(self):
+        archiver, gmail = self._archiver(
+            GOOGLE_GMAIL_REPORT_RECIPIENTS=["a@x.com", "b@y.com"]
+        )
+
+        result = archiver.export("case-1", self.INVESTIGATION, self.REPORT)
+
+        self.assertEqual(result["gmail"]["status"], "sent")
+        self.assertEqual(result["gmail"]["recipients"], ["a@x.com", "b@y.com"])
+        self.assertEqual(len(gmail.emails), 2)
+
+    def test_send_failure_is_swallowed_and_reported(self):
+        archiver, gmail = self._archiver()
+        gmail.fail = True
+
+        result = archiver.export("case-1", self.INVESTIGATION, self.REPORT)
+
+        self.assertEqual(result["gmail"]["status"], "failed")
+        self.assertEqual(gmail.emails, [])
+
+    def test_recipients_parsed_from_csv_string(self):
+        archiver, gmail = self._archiver(
+            GOOGLE_GMAIL_REPORT_RECIPIENTS="a@x.com, b@y.com"
+        )
+
+        result = archiver.export("case-1", self.INVESTIGATION, self.REPORT)
+
+        self.assertEqual(result["gmail"]["recipients"], ["a@x.com", "b@y.com"])
+
+    def test_subject_uses_prefix_and_title(self):
+        archiver, gmail = self._archiver(
+            GOOGLE_GMAIL_REPORT_SUBJECT_PREFIX="[TraceAI]"
+        )
+
+        archiver.export("case-1", self.INVESTIGATION, self.REPORT)
+
+        self.assertEqual(gmail.emails[0]["subject"], "[TraceAI]: TraceAI Report")
+
+
+class TestEndToEndGoogleWorkflow(unittest.TestCase):
+    """
+    The complete archive workflow with the REAL Drive / Sheets / Gmail
+    clients (stub HTTP transport, no network): connect all three, then
+    one ``EvidenceArchiver.export()`` must push to all three at once -
+    exactly what happens at the end of an /analyze turn once the scammer
+    details are fetched.
+    """
+
+    INVESTIGATION = {
+        "threat_type": "Banking Phishing",
+        "risk_score": 91,
+        "risk_level": "HIGH",
+        "is_scam": True,
+        "confidence": 88,
+        "phone_numbers": ["+919876543210"],
+        "emails": ["fraud@sbi-secure.co.in"],
+        "urls": ["http://sbi-secure-login.co.in/claim"],
+        "upi_ids": ["scammer@ybl"],
+        "bank_names": ["SBI"],
+        "amounts": ["₹25,000"],
+    }
+    REPORT = {
+        "title": "TraceAI Investigation Report - Banking Phishing",
+        "markdown": "# Report\n\nFull scam breakdown with IOCs.",
+    }
+
+    def test_one_export_updates_sheets_drive_and_emails_gmail(self):
+        creds = write_credentials_file()
+
+        # --- Drive: connect (about.get) then a multipart upload ---
+        drive = GoogleDriveIntegration(
+            make_settings(creds),
+            http_client=StubHTTPClient(
+                token_response(),
+                drive_about_response(),
+                StubResponse({
+                    "id": "drive-file-1",
+                    "name": "report.md",
+                    "webViewLink": "https://drive.google.com/file/drive-file-1",
+                }),
+            ),
+        )
+        drive.connect()
+
+        # --- Sheets: connect (metadata) then upsert one case row ---
+        sheets = GoogleSheetsIntegration(
+            make_settings(creds, GOOGLE_SHEETS_SPREADSHEET_ID="sheet-1"),
+            http_client=StubHTTPClient(
+                token_response(),
+                StubResponse({
+                    "spreadsheetId": "sheet-1",
+                    "properties": {"title": "SCAMNET Evidence"},
+                    "sheets": [{"properties": {"title": "Evidence"}}],
+                }),
+                StubResponse({"values": []}),            # A2:A (no row yet)
+                StubResponse({"values": []}),            # A1:A1 (no header)
+                StubResponse({"updates": {               # append
+                    "updatedRows": 2,
+                    "updatedRange": "Evidence!A1:M2",
+                }}),
+                StubResponse({"values": [["case-99"]]}), # A2:A recheck
+            ),
+        )
+        sheets.connect()
+
+        # --- Gmail: connect (profile) then send the report e-mail ---
+        gmail = GmailIntegration(
+            make_settings(creds),
+            http_client=StubHTTPClient(
+                token_response(),
+                StubResponse({
+                    "emailAddress": "analyst@example.com",
+                    "messagesTotal": 42,
+                    "threadsTotal": 17,
+                }),
+                StubResponse({"id": "msg-1", "threadId": "thread-1"}),
+            ),
+        )
+        gmail.connect()
+
+        # All three report a genuine, health-verified session.
+        self.assertTrue(drive.is_connected())
+        self.assertTrue(sheets.is_connected())
+        self.assertTrue(gmail.is_connected())
+
+        archiver = EvidenceArchiver(
+            drive=drive,
+            sheets=sheets,
+            gmail=gmail,
+            settings=make_archiver_settings(
+                GOOGLE_GMAIL_REPORT_RECIPIENTS=["soc@company.com"],
+            ),
+        )
+
+        result = archiver.export(
+            case_id="case-99",
+            investigation=self.INVESTIGATION,
+            report=self.REPORT,
+            drive_file_id=None,          # first turn -> upload, not update
+            report_already_emailed=False,
+        )
+
+        # --- Drive: report uploaded ---
+        self.assertEqual(result["google_drive"]["status"], "uploaded")
+        self.assertEqual(result["google_drive"]["file_id"], "drive-file-1")
+
+        # --- Sheets: one evidence row created ---
+        self.assertEqual(result["google_sheets"]["status"], "created")
+        self.assertEqual(result["google_sheets"]["spreadsheet_id"], "sheet-1")
+
+        # --- Gmail: report e-mailed to the stakeholder ---
+        self.assertEqual(result["gmail"]["status"], "sent")
+        self.assertEqual(result["gmail"]["recipients"], ["soc@company.com"])
+
+        # The e-mail body carries the verdict, the IOCs and the Drive
+        # link. The raw payload is a MIME message whose text part is
+        # base64-encoded, so parse it properly instead of substring-
+        # matching the outer envelope.
+        import base64
+        from email import message_from_bytes
+
+        raw = gmail._http_client.calls[-1]["json"]["raw"]
+        mime = message_from_bytes(base64.urlsafe_b64decode(raw))
+        # get_payload(decode=True) reverses the part's base64 transfer
+        # encoding and returns the plain-text body bytes.
+        decoded = mime.get_payload(decode=True).decode("utf-8")
+
+        self.assertEqual(mime["To"], "soc@company.com")
+        self.assertIn("Banking Phishing", decoded)
+        self.assertIn("https://drive.google.com/file/drive-file-1", decoded)
+        self.assertIn("sbi-secure-login.co.in", decoded)
+        self.assertIn("SCAM", decoded)
+
+    def test_second_turn_updates_drive_and_skips_duplicate_email(self):
+        """Later turns: Drive file is UPDATED, Gmail is not re-sent."""
+        creds = write_credentials_file()
+
+        drive = GoogleDriveIntegration(
+            make_settings(creds),
+            http_client=StubHTTPClient(
+                token_response(),
+                drive_about_response(),
+                StubResponse({"id": "drive-file-1", "name": "report.md"}),
+            ),
+        )
+        drive.connect()
+
+        gmail = StubIntegration()  # already-connected stub is enough here
+
+        archiver = EvidenceArchiver(
+            drive=drive,
+            sheets=StubIntegration(),
+            gmail=gmail,
+            settings=make_archiver_settings(),
+        )
+
+        result = archiver.export(
+            case_id="case-99",
+            investigation=self.INVESTIGATION,
+            report=self.REPORT,
+            drive_file_id="drive-file-1",     # known file -> update in place
+            report_already_emailed=True,       # e-mailed on turn 1
+        )
+
+        self.assertEqual(result["google_drive"]["status"], "updated")
+        self.assertEqual(result["gmail"]["status"], "skipped")
+        self.assertEqual(result["gmail"]["reason"], "already_sent")
+        self.assertEqual(gmail.emails, [])
 
 
 if __name__ == "__main__":
