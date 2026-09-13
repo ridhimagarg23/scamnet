@@ -123,9 +123,13 @@ Return ONLY valid JSON.
 =====================================
 """
 
+        # The markdown report is the longest agent output by far, hence the
+        # larger budget - still capped so a verbose model cannot stall the
+        # turn (or the per-token bill) without bound.
         result = self.llm.generate(
             final_prompt,
-            json_output=True
+            json_output=True,
+            max_tokens=2500,
         )
 
         # ----------------------------

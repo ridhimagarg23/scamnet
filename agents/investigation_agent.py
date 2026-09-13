@@ -139,9 +139,12 @@ Return ONLY valid JSON.
 =========================
 """
 
+        # The verdict JSON is ~150 tokens; the budget only bounds a slow
+        # or overly verbose model so one turn cannot stall /analyze.
         result = self.llm.generate(
             final_prompt,
-            json_output=True
+            json_output=True,
+            max_tokens=800,
         )
 
         # ----------------------------

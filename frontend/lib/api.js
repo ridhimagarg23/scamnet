@@ -2,13 +2,21 @@
 // ======
 // Single place that decides where the browser sends API calls.
 //
-// The dashboard normally uses the SAME-ORIGIN Next.js proxy
-// (`/backend-api/...`), which next.config.mjs forwards to the FastAPI
-// backend. This works in local dev, Vercel preview/production and
-// behind a reverse proxy - the browser does not need CORS and never
-// embeds backend credentials.
+// Two modes, one helper (`apiUrl()`), used by every call site:
 //
-// Override with NEXT_PUBLIC_API_URL only for deployments where the
+// * DIRECT (local `run_all` runs): `NEXT_PUBLIC_API_URL` points the
+//   browser straight at FastAPI. This is the default locally because
+//   POST /analyze runs three sequential LLM calls (~35-50 s on a slow
+//   model) while the Next.js dev rewrite proxy drops proxied requests
+//   after ~30 s ("Failed to proxy ... socket hang up", ECONNRESET) -
+//   the backend keeps working, but the dashboard sees a 500. Browser
+//   fetch has no such ceiling. run_all.py also pre-fills the backend's
+//   CORS_ALLOW_ORIGINS, so no manual CORS setup is needed.
+// * PROXY (hosted/Vercel): without NEXT_PUBLIC_API_URL the browser
+//   stays same-origin (`/backend-api/...`), which next.config.mjs
+//   forwards to the FastAPI backend - no CORS needed at all.
+//
+// Override with NEXT_PUBLIC_API_URL for any deployment where the
 // browser should call the backend directly. The backend's
 // CORS_ALLOW_ORIGINS must then include this frontend's origin.
 // -------------------------------------------------------------------
@@ -85,9 +93,18 @@ export async function createApiError(response) {
         message = 'The AI or messaging provider is rate-limiting requests. Wait a moment and retry.';
         break;
       case 500:
-        message =
-          'The backend reached but the investigation pipeline failed. ' +
-          'Check the server logs or the backend URL in BACKEND_INTERNAL_URL.';
+        // A 500 WITH a FastAPI JSON body is a genuine pipeline failure
+        // and already produced `message` above. Reaching this branch
+        // means the body was NOT JSON - typically the Next.js proxy's
+        // plain-text "Internal Server Error" after it drops a slow
+        // /analyze request at ~30 s (ECONNRESET "socket hang up") while
+        // the backend is still working through the AI calls. Point at
+        // the backend logs, not at the (usually correct) proxy URL.
+        message = body
+          ? 'The backend failed while running the investigation pipeline. ' +
+            'Check the backend [api] server logs for the traceback.'
+          : 'Lost contact with the backend during analysis. ' +
+            'Check the backend [api] server logs - it may still be working.';
         break;
       case 502:
       case 503:

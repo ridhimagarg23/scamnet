@@ -296,6 +296,7 @@ Both accept the same flags:
 | `--reload` | restart the backend when Python files change |
 | `--backend-port N` / `--frontend-port N` | use other ports (default `8001` / `3000`) |
 | `--skip-install` | never run `npm install` |
+| `--use-proxy` | route browser calls through `/backend-api` (reproduces hosted; slow turns may time out) |
 
 The launcher prints a readiness report (missing keys, degraded mode), installs
 dashboard dependencies the first time, waits until each service really answers,
@@ -358,10 +359,7 @@ Drive/Sheets/Gmail clients (credentials → token refresh → authorized call �
 
 The dashboard's **Connected Apps** modal (sidebar → *Connected Apps*) reports the
 **real** server-side state of four external apps. Every app implements a genuine
-authentication handshake — nothing is ever shown as "connected" unless the remote
-service itself accepted the credentials.
-
-| App | Role | What `Connect` actually does | Required server-side settings |
+authentication handshake — nothing is ever shown ased server-side settings |
 |---|---|---|---|
 | **Telegram** | Communication & intelligence gathering | `getMe` verifies the bot token and returns the bot identity | `TELEGRAM_BOT_TOKEN` |
 | **Google Sheets** | Live investigation evidence | Reads the target spreadsheet, or **creates** `SCAMNET Investigation Evidence` when no id is set, then guarantees the `Evidence` tab | `GOOGLE_SHEETS_CREDENTIALS_FILE` *(or `GOOGLE_CREDENTIALS_FILE`)*, optional `GOOGLE_SHEETS_SPREADSHEET_ID`, `GOOGLE_SHEETS_WORKSHEET` |
@@ -509,6 +507,39 @@ API (connect -> auto-start -> message in -> persona reply out -> second turn ->
 
 ---
 
+## 🩺 Troubleshooting
+
+### "Lost contact with the backend during analysis" / `Failed to proxy ... socket hang up`
+
+**Cause:** `POST /analyze` runs three sequential OpenRouter calls (investigation →
+conversation → report). On a slow model each call takes 10-15 s, so a turn lasts
+35-50 s — but the Next.js **dev** rewrite proxy (`/backend-api` → FastAPI) drops
+the connection after ~30 s with `ECONNRESET`. The backend keeps working (watch
+the `[api]` lines: `stage 'investigation' took ...`), while the dashboard reports
+a 500. Fast endpoints (`/health`, `/new`, integrations) are unaffected, which is
+why only scam-message analysis fails.
+
+**Fix:** pull the latest code and re-run `run_all` — the launcher now points the
+browser directly at FastAPI (`NEXT_PUBLIC_API_URL`, CORS pre-filled), and browser
+`fetch` has no 30 s ceiling. If you still see it, check the `[api]` stage timings:
+every stage taking 15 s+ means the model itself is slow — try a faster
+`LLM_MODEL` or check https://openrouter.ai status.
+
+### "Cannot reach the backend" in the browser, but `curl` works
+
+You are calling the API cross-origin (direct mode) from an origin the backend does
+not allow. Either open the dashboard via `http://localhost:3000` /
+`http://127.0.0.1:3000`, or add your origin to `CORS_ALLOW_ORIGINS` in `.env`
+(`run_all` pre-fills localhost + LAN IP automatically).
+
+### `/analyze` answers 503 `llm_not_configured`
+
+`OPENROUTER_API_KEY` is missing from the server-side `.env`. The server boots
+anyway (health + integrations keep working) — add the key and restart. Same fix
+when the Telegram loop answers `/start` but fails every other message.
+
+---
+
 ## 🧭 Interactive Developer Guide
 
 **Want to really understand the codebase?** Open the **interactive HTML architecture guide** — a single self-contained file with clickable flowcharts, hoverable agent cards, expandable data contracts, an objective-ladder walkthrough and a live risk-score simulator:
@@ -516,6 +547,11 @@ API (connect -> auto-start -> message in -> persona reply out -> second turn ->
 👉 [`docs/interactive-guide.html`](docs/interactive-guide.html)
 
 *(Open it directly in any browser — no build step, no internet required.)*
+
+---
+
+Made with 🛡️ for scam research and threat intelligence.
+in any browser — no build step, no internet required.)*
 
 ---
 

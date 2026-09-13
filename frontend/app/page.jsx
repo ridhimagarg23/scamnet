@@ -50,10 +50,10 @@ export default function DashboardPage() {
   const timerRef = useRef(null);
   const thinkingIntervalRef = useRef(null);
 
-  // API calls always go through lib/api.js: same-origin /backend-api
-  // (proxied by next.config.mjs) unless NEXT_PUBLIC_API_URL overrides
-  // it. The browser therefore never talks to 127.0.0.1 or to a
-  // hard-coded host that may not exist.
+  // API calls always go through lib/api.js: directly to the backend in
+  // local `run_all` runs (NEXT_PUBLIC_API_URL, so slow /analyze turns
+  // never hit the Next.js proxy's ~30 s ceiling), via the same-origin
+  // /backend-api proxy (next.config.mjs) when hosted.
 
   // Session timer: ticks every second while the dashboard is mounted
   // (drives the "Running • MM:SS" readout in the top bar).
@@ -110,12 +110,13 @@ export default function DashboardPage() {
     };
   }, [isThinking]);
 
-  // Error toast auto-dismiss after 5 s.
+  // Error toast auto-dismiss after 8 s (backend/CORS hints are long
+  // enough that 5 s does not leave time to read them).
   useEffect(() => {
     if (errorMessage) {
       const t = setTimeout(() => {
         setErrorMessage(null);
-      }, 5000);
+      }, 8000);
       return () => clearTimeout(t);
     }
   }, [errorMessage]);
