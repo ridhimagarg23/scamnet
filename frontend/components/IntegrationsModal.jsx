@@ -76,6 +76,32 @@ const INTEGRATION_ICONS = {
   )
 };
 
+// "bot_username" -> "Bot username" (connection_info keys are snake_case).
+const humanizeKey = (key) => {
+  const words = String(key).replace(/[_\-.]+/g, ' ').trim().split(/\s+/);
+  if (!words.length) return String(key);
+  const [first, ...rest] = words;
+  return [first.charAt(0).toUpperCase() + first.slice(1), ...rest]
+    .join(' ')
+    .toLowerCase()
+    .replace(/^./, (c) => c.toUpperCase());
+};
+
+// Turn the server's secret-free connection_info dict into renderable
+// "Label: value" strings. Values that are null/empty or non-primitive
+// are dropped - we only ever surface facts the backend actually
+// reported, and never a stray "[object Object]".
+const normalizeConnectionInfo = (info) => {
+  if (!info || typeof info !== 'object' || Array.isArray(info)) return [];
+
+  return Object.entries(info)
+    .filter(([, value]) =>
+      ['string', 'number', 'boolean'].includes(typeof value)
+    )
+    .filter(([, value]) => String(value).trim() !== '')
+    .map(([key, value]) => `${humanizeKey(key)}: ${value}`);
+};
+
 export default function IntegrationsModal({ isOpen, onClose }) {
   // id -> status object from the backend (null until first load).
   const [statuses, setStatuses] = useState(null);
@@ -311,6 +337,11 @@ export default function IntegrationsModal({ isOpen, onClose }) {
   if (!isOpen) return null;
 
   // Derive the honest per-card view: badge/dot kind + labels.
+  //
+  // NOTE: this is the ONLY place the raw per-id status object (`st`) is
+  // read. Everything the JSX needs - connection_info included - is
+  // handed back on this view object, because `st` is scoped to this
+  // function and is NOT visible inside the render loop below.
   const getCardView = (id) => {
     const fallback = INTEGRATION_FALLBACKS.find((f) => f.id === id) || {};
     const st = statuses?.[id] || null;
@@ -321,25 +352,29 @@ export default function IntegrationsModal({ isOpen, onClose }) {
 
     const setup = st?.setup_instructions || '';
     const configured = Boolean(st?.configured);
+    // Server-reported, secret-free facts about a live session (bot
+    // username, Google account, ...). Only ever non-empty when the
+    // backend says connected=true.
+    const connectionInfo = normalizeConnectionInfo(st?.connection_info);
 
     if (isLoading && !st) {
-      return { name, purpose, kind: 'unknown', label: 'Checking...', detail: '', setup: '', configured: false, attempt: null };
+      return { name, purpose, kind: 'unknown', label: 'Checking...', detail: '', setup: '', configured: false, attempt: null, connectionInfo: [] };
     }
     if (!st) {
       // Backend unreachable / not loaded: honest "unknown" - never
       // presented as connected.
-      return { name, purpose, kind: 'unknown', label: 'Status unknown', detail: '', setup: '', configured: false, attempt: null };
+      return { name, purpose, kind: 'unknown', label: 'Status unknown', detail: '', setup: '', configured: false, attempt: null, connectionInfo: [] };
     }
     if (st.connected) {
-      return { name, purpose, kind: 'connected', label: 'Connected', detail: st.detail || '', setup, configured, attempt: null };
+      return { name, purpose, kind: 'connected', label: 'Connected', detail: st.detail || '', setup, configured, attempt: null, connectionInfo };
     }
     if (attempt?.kind === 'setup') {
-      return { name, purpose, kind: 'setup', label: 'Setup required', detail: st.detail || '', setup, configured, attempt };
+      return { name, purpose, kind: 'setup', label: 'Setup required', detail: st.detail || '', setup, configured, attempt, connectionInfo: [] };
     }
     if (attempt?.kind === 'error') {
-      return { name, purpose, kind: 'error', label: 'Connection failed', detail: st.detail || '', setup, configured, attempt };
+      return { name, purpose, kind: 'error', label: 'Connection failed', detail: st.detail || '', setup, configured, attempt, connectionInfo: [] };
     }
-    return { name, purpose, kind: 'off', label: 'Not connected', detail: st.detail || '', setup, configured, attempt: null };
+    return { name, purpose, kind: 'off', label: 'Not connected', detail: st.detail || '', setup, configured, attempt: null, connectionInfo: [] };
   };
 
   // Honest summary of the Telegram reply loop for the card panel.
@@ -415,16 +450,14 @@ export default function IntegrationsModal({ isOpen, onClose }) {
                   )}
 
                   {/* Server-reported, secret-free facts about a live
-                      session (bot username, Google account, ...) */}
-                  {view.kind === 'connected' && st?.connection_info &&
-                    Object.keys(st.connection_info).length > 0 && (
-                      <p className="integ-connection-info">
-                        {Object.entries(st.connection_info)
-                          .filter(([, value]) => value !== null && value !== undefined && value !== '')
-                          .map(([key, value]) => `${key.replace(/_/g, ' ')}: ${value}`)
-                          .join(' · ')}
-                      </p>
-                    )}
+                      session (bot username, Google account, ...).
+                      Read from the view object - `st` is local to
+                      getCardView() and does not exist in this scope. */}
+                  {view.kind === 'connected' && view.connectionInfo.length > 0 && (
+                    <p className="integ-connection-info">
+                      {view.connectionInfo.join(' · ')}
+                    </p>
+                  )}
 
                   {/* Telegram reply loop: a connected bot that is not
                       polling never answers anything, so its state and
