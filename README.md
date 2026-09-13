@@ -220,9 +220,12 @@ cp .env.example .env
 OPENROUTER_API_KEY=your-openrouter-api-key   # https://openrouter.ai/keys
 NVIDIA_NIM_API_KEY=your-nvidia-nim-api-key   # https://build.nvidia.com (fastest)
 
-# Optional — defaults: qwen/qwen3-32b and meta/llama-3.1-8b-instruct
+# Optional — OpenRouter answers first; NVIDIA is the fallback stage
 LLM_MODEL=qwen/qwen3-32b
-NVIDIA_NIM_MODEL=meta/llama-3.1-8b-instruct
+NVIDIA_NIM_MODEL=nvidia/nemotron-3-ultra-550b-a55b
+
+# Optional — how long OpenRouter may take before NVIDIA takes over
+OPENROUTER_DEADLINE=15
 
 # Optional — extra browser origins allowed to call the API cross-origin
 CORS_ALLOW_ORIGINS=https://my-dashboard.example
@@ -239,28 +242,38 @@ GOOGLE_DRIVE_FOLDER_ID=1XyZ...
 > `POST /analyze` answers HTTP **503 `llm_not_configured`** — so you can verify the
 > Telegram/Google setup first. Set `TRACEAI_STRICT_CONFIG=1` to fail fast instead.
 
-### ⚡ AI Engine: OpenRouter + NVIDIA NIM, model picker & fallback
+### ⚡ AI Engine: fixed flow — OpenRouter first, NVIDIA nemotron as fallback
 
-- **Two providers.** OpenRouter (default) plus NVIDIA NIM, the lightning-fast
-  option. Add `NVIDIA_NIM_API_KEY` to `.env`, restart the backend, then pick
-  **⚡ NVIDIA NIM** in the dashboard's **AI Engine** bar (no restart needed to
-  switch afterwards).
-- **Model picker (frontend).** The AI Engine bar lists curated models per
-  provider with speed badges. The **⟳** button fetches the *live* model list
-  from the provider's `/models` endpoint. Your pick is sent with every
-  `/analyze` call and remembered per provider.
-- **Add your own models.** Paste NVIDIA ids fetched from
-  [build.nvidia.com](https://build.nvidia.com) into **`llm_models.json`** at the
-  repo root (or `NVIDIA_NIM_MODELS` / `OPENROUTER_MODELS` in `.env`) — they show
-  up in the picker automatically. Unknown ids still run (with a hint) instead of
-  erroring.
-- **Automatic fallback (backend).** Every call tries primary → provider spares
-  (`*_FALLBACK_MODELS`) → the *other* provider's models when its key exists.
-  Unknown-model ids hop immediately, dead keys skip the whole provider, and
-  NVIDIA's short 30 s timeout fails over fast. Each `/analyze` response includes
-  an `llm` block showing which provider/model actually answered each stage.
-- **API.** `GET /api/llm/status`, `GET /api/llm/models?provider=nvidia&refresh=true`,
-  `POST /api/llm/select` — secret-free, safe for the dashboard.
+The engine is **not** selectable in the dashboard any more: one pasted scammer
+message always takes the same route, so results stay predictable (and the UI
+stops hammering `/api/llm/*` on every render).
+
+```
+user pastes a message
+        |
+        v
+1. OpenRouter  (LLM_MODEL, default qwen/qwen3-32b)
+        |   no reply within OPENROUTER_DEADLINE = 15 s  ->  call abandoned
+        v
+2. NVIDIA NIM  nvidia/nemotron-3-ultra-550b-a55b        (priority)
+        |   failed / too slow
+        v
+3. NVIDIA NIM  nvidia/nemotron-3.5-lightning-30b-a3b    (last resort)
+```
+
+- **OpenRouter first, always.** Add `OPENROUTER_API_KEY` to `.env`. If it
+  answers inside 15 s the turn is done — NVIDIA is never touched.
+- **15-second soft deadline.** `OPENROUTER_DEADLINE=15` (seconds; `0` disables
+  it). The slow call is abandoned, **not retried**, so you never wait on a
+  stalled gateway.
+- **Exactly two NVIDIA models**, in this order: Nemotron 3 Ultra first,
+  Nemotron 3.5 Lightning only when Ultra fails. Get the key at
+  [build.nvidia.com](https://build.nvidia.com) and set `NVIDIA_NIM_API_KEY`.
+- **Each `/analyze` response still reports the truth:** the `llm` block shows
+  which provider/model answered each stage and how many fallbacks were used.
+- **Escape hatches (ops only, not in the UI):** `POST /api/llm/select`,
+  `GET /api/llm/status`, `GET /api/llm/models?provider=nvidia&refresh=true` —
+  secret-free endpoints for debugging a deployment.
 
 > ⚠️ **Tests:** the unit suite mocks the LLM. Run it with a dummy key:
 > `OPENROUTER_API_KEY=test-key python -m unittest discover -s tests`.

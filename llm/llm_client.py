@@ -9,9 +9,17 @@ LLM plumbing here gives us:
 
 * One place to configure the providers (OpenRouter + NVIDIA NIM).
 * Automatic JSON parsing / cleanup for structured agent output.
-* A resilient fallback chain: primary model -> provider spares ->
-  the OTHER provider's models - so one slow/dead/rate-limited model
-  never fails the whole investigation.
+* A fixed, predictable request flow so one slow/dead/rate-limited
+  model never fails the whole investigation::
+
+      1. OpenRouter (the model configured via ``LLM_MODEL``)
+      2. no answer within ``OPENROUTER_DEADLINE`` (15 s by default)?
+         -> NVIDIA NIM: nvidia/nemotron-3-ultra-550b-a55b
+      3. Ultra failed too?
+         -> NVIDIA NIM: nvidia/nemotron-3.5-lightning-30b-a3b
+
+  The OpenRouter call is abandoned (not retried) once its deadline is
+  gone, so the analyst never waits on a slow gateway.
 
 Supported features
 ------------------
@@ -51,6 +59,18 @@ from config import (
 )
 
 logger = logging.getLogger("TraceAI-LLM")
+
+
+def _now() -> float:
+    """
+    Monotonic clock used by :meth:`LLMClient.generate`.
+
+    A module-level function (instead of calling ``time.monotonic()``
+    inline) so tests can install a fake clock and prove the soft
+    deadline behaviour without sleeping in real time.
+    """
+
+    return time.monotonic()
 
 
 class LLMNotConfiguredError(RuntimeError):
@@ -216,6 +236,12 @@ class LLMClient:
         self.model = resolved_model
         self.timeout_override = timeout
 
+        # True when the caller named a provider explicitly. Only an
+        # IMPLICIT call (the normal "user pasted a message" path) is
+        # re-ordered to start on the primary provider - see
+        # ``attempt_chain()``.
+        self.explicit_provider = bool(provider)
+
         # Lazily-built OpenAI SDK clients, one per provider.
         self._clients: dict = {}
 
@@ -266,39 +292,70 @@ class LLMClient:
         """
         Return the ordered ``[(provider, model), ...]`` fallback chain.
 
-        1. The requested (primary) model.
-        2. That provider's configured spare models (fastest first).
-        3. When cross-provider fallback is enabled and the other
-           provider's key exists: the other provider's default model +
-           its spares.
+        The project's fixed request flow (see the module docstring):
+
+        1. OpenRouter - the provider EVERY turn starts on. When the
+           caller did not name a provider explicitly, the primary
+           provider is forced to the front even if the runtime-active
+           selection drifted (e.g. via ``POST /api/llm/select``).
+        2. The requested/active model + that provider's spares.
+        3. When cross-provider fallback is enabled: the OTHER provider's
+           chain - for NVIDIA that is Nemotron 3 Ultra followed by
+           Nemotron 3.5 Lightning.
+
+        Duplicates are dropped, so each model is tried at most once.
         """
 
-        chain: list = [(self.provider, self.model)]
+        chain: list = []
 
-        for spare in settings.get_fallback_models(self.provider):
-            candidate = (self.provider, spare)
+        def add(provider: str, model: str | None) -> None:
+            model_id = str(model or "").strip()
+
+            if not model_id:
+                return
+
+            candidate = (provider, model_id)
 
             if candidate not in chain:
                 chain.append(candidate)
 
-        if settings.LLM_CROSS_PROVIDER_FALLBACK:
-            other = (
-                PROVIDER_NVIDIA
-                if self.provider == PROVIDER_OPENROUTER
-                else PROVIDER_OPENROUTER
+        # (1) A pasted message ALWAYS goes to the primary provider
+        #     first - unless the caller explicitly asked for another
+        #     provider (an API override must be respected).
+        if (
+            not self.explicit_provider
+            and self.provider != settings.PRIMARY_PROVIDER
+            and settings.is_provider_configured(settings.PRIMARY_PROVIDER)
+        ):
+            add(
+                settings.PRIMARY_PROVIDER,
+                settings.get_default_model(settings.PRIMARY_PROVIDER),
             )
 
-            if settings.is_provider_configured(other):
-                candidate = (other, settings.get_default_model(other))
+        # (2) The requested/active model and its spares.
+        add(self.provider, self.model)
 
-                if candidate not in chain:
-                    chain.append(candidate)
+        for spare in settings.get_fallback_models(self.provider):
+            add(self.provider, spare)
 
-                for spare in settings.get_fallback_models(other):
-                    candidate = (other, spare)
+        # (3) Cross-provider fallback, primary provider first.
+        if settings.LLM_CROSS_PROVIDER_FALLBACK:
+            others = [
+                provider
+                for provider in (PROVIDER_OPENROUTER, PROVIDER_NVIDIA)
+                if provider != self.provider
+                and settings.is_provider_configured(provider)
+            ]
 
-                    if candidate not in chain:
-                        chain.append(candidate)
+            others.sort(
+                key=lambda p: 0 if p == settings.PRIMARY_PROVIDER else 1
+            )
+
+            for provider in others:
+                add(provider, settings.get_default_model(provider))
+
+                for spare in settings.get_fallback_models(provider):
+                    add(provider, spare)
 
         return chain
 
@@ -330,7 +387,9 @@ class LLMClient:
         retries : int, default 2
             Attempts PER MODEL before moving to the next fallback model.
             Wait time backs off exponentially (1 s, 2 s, ...) capped at
-            5 s so fail-over stays quick.
+            5 s so fail-over stays quick. A provider whose soft deadline
+            (``settings.get_deadline``, e.g. the 15 s OpenRouter window)
+            is already gone is NOT retried - the next model answers.
         max_tokens : int | None, default None
             Hard cap on the generated completion. Every agent passes a
             budget matched to its output shape (small JSON verdicts need
@@ -364,6 +423,12 @@ class LLMClient:
         # Providers whose key was rejected - skip their remaining models.
         dead_providers: set = set()
 
+        # Soft deadlines: ``{provider: monotonic_deadline}``. The clock
+        # starts when the provider's FIRST attempt begins, so the whole
+        # provider stage (not each retry) is bounded.
+        deadlines: dict = {}
+        stage_deadlines: dict = {}
+
         for chain_index, (provider, model) in enumerate(chain):
             is_last_model = chain_index == len(chain) - 1
 
@@ -375,7 +440,43 @@ class LLMClient:
 
             request_json_mode = json_output
 
+            # Arm the stage clock the first time this provider is used.
+            if provider not in deadlines:
+                budget = settings.get_deadline(provider)
+                deadlines[provider] = (
+                    _now() + budget if budget and budget > 0 else None
+                )
+                stage_deadlines[provider] = budget or 0.0
+
+            deadline = deadlines[provider]
+
             for attempt in range(attempts_per_model):
+                # Abandon the provider as soon as its deadline is gone:
+                # e.g. OpenRouter had 15 s and did not answer, so the
+                # NVIDIA stage starts right now.
+                if deadline is not None:
+                    remaining = deadline - _now()
+
+                    if remaining <= 0:
+                        self._record_fallback(
+                            provider,
+                            model,
+                            TimeoutError(
+                                f"no reply within "
+                                f"{stage_deadlines[provider]:g}s "
+                                f"(deadline exceeded)"
+                            ),
+                        )
+                        logger.warning(
+                            "'%s' did not answer within %gs - moving on to "
+                            "the next model in the chain.",
+                            provider,
+                            stage_deadlines[provider],
+                        )
+                        break
+                else:
+                    remaining = None
+
                 try:
                     request_kwargs: dict[str, Any] = {
                         "model": model,
@@ -396,7 +497,22 @@ class LLMClient:
                     if max_tokens is not None:
                         request_kwargs["max_tokens"] = max_tokens
 
+                    # Per-attempt timeout: never longer than the time
+                    # left in this provider's stage, so a hanging call
+                    # cannot blow past the deadline (e.g. the 15 s
+                    # OpenRouter window).
+                    request_timeout = (
+                        self.timeout_override
+                        or settings.get_timeout(provider)
+                    )
+
+                    if remaining is not None:
+                        request_timeout = max(
+                            1.0, min(request_timeout, remaining)
+                        )
+
                     response = self._client_for(provider).chat.completions.create(
+                        timeout=request_timeout,
                         **request_kwargs
                     )
 
@@ -508,8 +624,17 @@ class LLMClient:
                         request_json_mode = False
                         continue
 
-                    # Last attempt for THIS model -> record and move on.
-                    if attempt == attempts_per_model - 1:
+                    # Deadline gone (or last attempt) -> record and move
+                    # on to the next model instead of retrying a
+                    # provider that just proved it is too slow.
+                    budget_left = (
+                        None if deadline is None else deadline - _now()
+                    )
+
+                    if (
+                        attempt == attempts_per_model - 1
+                        or (budget_left is not None and budget_left <= 0)
+                    ):
                         self._record_fallback(provider, model, e)
 
                         if not is_last_model:
@@ -523,6 +648,14 @@ class LLMClient:
                         break
 
                     wait = min(2 ** attempt, 5)
+
+                    # Never sleep past the stage deadline either.
+                    if budget_left is not None:
+                        wait = min(wait, budget_left)
+
+                        if wait <= 0:
+                            self._record_fallback(provider, model, e)
+                            break
 
                     print(
                         f"\nRetry {attempt + 1}/{attempts_per_model} for "

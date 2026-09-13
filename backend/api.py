@@ -188,7 +188,7 @@ class InvestigationRequest(BaseModel):
 
 
 class LLMSelectRequest(BaseModel):
-    """Request body for POST /api/llm/select (dashboard model picker)."""
+    """Request body for POST /api/llm/select (ops/debug override)."""
 
     provider: str
     """Provider to activate (``openrouter`` / ``nvidia``)."""
@@ -551,7 +551,10 @@ def health():
 # --------------------------------------------------
 # LLM provider / model selection endpoints
 # --------------------------------------------------
-# The dashboard's model picker is driven by these three endpoints.
+# These endpoints describe/override the LLM selection for operators.
+# The dashboard no longer renders a picker: the engine order is fixed
+# (OpenRouter first, NVIDIA nemotron stage as the fallback), so these
+# are diagnostics + an escape hatch for API consumers.
 # Responses NEVER contain secret values - only key presence, model
 # ids and human-readable hints.
 
@@ -597,8 +600,9 @@ def llm_status():
     """
     Returns the active LLM provider/model plus per-provider status.
 
-    The dashboard calls this on load to render the provider toggle and
-    the model dropdown in the correct state.
+    Diagnostic endpoint (the dashboard no longer shows a picker) -
+    useful to confirm which keys the server sees. Never returns
+    secrets, only key presence.
     """
 
     return _llm_status_payload()
@@ -607,7 +611,7 @@ def llm_status():
 @app.get("/api/llm/models")
 def llm_models(provider: Optional[str] = None, refresh: bool = False):
     """
-    Returns the model catalog for one provider (dashboard picker).
+    Returns the model catalog for one provider (diagnostics).
 
     Query parameters
     ----------------
@@ -668,7 +672,7 @@ def llm_models(provider: Optional[str] = None, refresh: bool = False):
 @app.post("/api/llm/select")
 def llm_select(request: LLMSelectRequest):
     """
-    Switches the runtime-active LLM provider/model (dashboard picker).
+    Switches the runtime-active LLM provider/model (ops override).
 
     Any non-empty model id is accepted (new NIM releases work without
     a catalog update); unknown ids are flagged via ``model_known`` so
@@ -1090,9 +1094,9 @@ def analyze(request: InvestigationRequest):
             }
         )
 
-    # Per-request LLM override (dashboard model picker): an explicit
-    # provider/model wins for THIS turn only; otherwise the
-    # runtime-active selection (POST /api/llm/select) is used.
+    # Per-request LLM override: an explicit provider/model wins for
+    # THIS turn only. The dashboard never sends one, so the fixed flow
+    # (OpenRouter -> NVIDIA nemotron stage) applies.
     requested_provider = (request.provider or "").strip() or None
     requested_model = (request.model or "").strip() or None
 
@@ -1113,6 +1117,14 @@ def analyze(request: InvestigationRequest):
     llm_provider, llm_model = settings.resolve_provider_model(
         requested_provider, requested_model
     )
+
+    # The agents only get an override when the CALLER really named one.
+    # The dashboard never does: it lets the LLM layer run its fixed flow
+    # (OpenRouter first -> NVIDIA nemotron stage as fallback), instead of
+    # pinning whatever provider happens to be marked active on the
+    # server right now.
+    agent_provider = requested_provider
+    agent_model = requested_model
 
     logger.info(
         f"Processing message in session '{session_id}': "
@@ -1164,7 +1176,7 @@ def analyze(request: InvestigationRequest):
 
         stage_started = time.perf_counter()
         investigation_agent = InvestigationAgent(
-            provider=llm_provider, model=llm_model
+            provider=agent_provider, model=agent_model
         )
         investigation_result = investigation_agent.run(message)
         _log_stage(session_id, "investigation", stage_started)
@@ -1346,7 +1358,7 @@ def analyze(request: InvestigationRequest):
 
         stage_started = time.perf_counter()
         conversation_agent = ConversationAgent(
-            provider=llm_provider, model=llm_model
+            provider=agent_provider, model=agent_model
         )
         conversation_result = conversation_agent.run(
             investigation=investigation_result,
@@ -1433,7 +1445,7 @@ def analyze(request: InvestigationRequest):
         try:
 
             report_agent = ReportAgent(
-                provider=llm_provider, model=llm_model
+                provider=agent_provider, model=agent_model
             )
             report_result = report_agent.run(
                 investigation=investigation_result,
