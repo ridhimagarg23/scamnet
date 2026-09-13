@@ -103,6 +103,9 @@ class ConversationResult(BaseModel):
     expected_outcome: str
     """What the agent hopes the scammer reveals next."""
 
+    objective_achieved: bool = False
+    """Whether the latest inbound message completed the active objective."""
+
 
 class ReportResult(BaseModel):
     """

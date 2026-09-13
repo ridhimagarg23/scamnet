@@ -50,6 +50,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from config import settings
+from llm.llm_client import LLMNotConfiguredError
 
 from agents.investigation_agent import InvestigationAgent
 from agents.conversation_agent import ConversationAgent
@@ -857,7 +858,8 @@ def analyze(request: InvestigationRequest):
                 "investigation": None,
                 "report": None,
                 "persona_profile": None,
-                "timeline": []
+                "timeline": [],
+                "turn_count": 0
             }
 
         state_data = sessions[session_id]
@@ -1035,39 +1037,10 @@ def analyze(request: InvestigationRequest):
 
             investigation_result = existing_inv
 
-            # --------------------------------------------------
-            # Advance engine objective/strategy state
-            # --------------------------------------------------
-
-            engine_state = engine.update(
-                objective_completed=True
-            )
-
-            # --------------------------------------------------
-            # Synchronize modified engine state inside persona
-            # --------------------------------------------------
-
-            state_data["persona_profile"]["traits"][3]["value"] = (
-                engine_state.current_strategy
-            )
-
-            state_data["persona_profile"]["traits"][5]["value"] = (
-                engine_state.current_objective
-            )
-
-            state_data["persona_profile"]["aiTip"] = (
-                f"Objective: {engine_state.current_objective}. "
-                f"Strategy: {engine_state.current_strategy} "
-                f"response style."
-            )
-
-            timeline.append({
-                "time": get_current_time_str(),
-                "text": (
-                    "Scammer response analyzed. Strategy advanced to: "
-                    f"{engine_state.current_strategy}"
-                )
-            })
+            # The objective ladder is advanced only after the
+            # ConversationAgent confirms that this inbound message
+            # delivered the evidence requested by the active objective.
+            engine_state = engine.get_state()
 
         # --------------------------------------------------
         # 3. Record the scammer message, then generate the
@@ -1087,6 +1060,42 @@ def analyze(request: InvestigationRequest):
         session.add_traceai_reply(
             conversation_result.reply
         )
+
+        # Count every processed turn, but advance the evidence ladder
+        # only when the model confirms the inbound message supplied the
+        # artifact the active objective was waiting for.
+        state_data["turn_count"] = (
+            state_data.get("turn_count", 0) + 1
+        )
+        engine_state = engine.update(
+            objective_completed=conversation_result.objective_achieved
+        )
+        engine_state.turn_number = state_data["turn_count"]
+
+        # Keep the UI persona card synchronized with the strategy brain.
+        state_data["persona_profile"]["traits"][3]["value"] = (
+            engine_state.current_strategy
+        )
+
+        state_data["persona_profile"]["traits"][5]["value"] = (
+            engine_state.current_objective
+        )
+
+        state_data["persona_profile"]["aiTip"] = (
+            f"Objective: {engine_state.current_objective}. "
+            f"Strategy: {engine_state.current_strategy} "
+            f"response style."
+        )
+
+        if conversation_result.objective_achieved:
+
+            timeline.append({
+                "time": get_current_time_str(),
+                "text": (
+                    "Objective evidence secured; strategy advanced to: "
+                    f"{engine_state.current_strategy}"
+                )
+            })
 
         timeline.append({
             "time": get_current_time_str(),
@@ -1108,21 +1117,41 @@ def analyze(request: InvestigationRequest):
         # 5. Generate the latest investigation report
         # --------------------------------------------------
         # The report is re-generated each turn, so the stored report
-        # always reflects the newest accumulated evidence.
+        # normally reflects the newest accumulated evidence. It is a
+        # presentation layer, though: a report-provider failure must not
+        # discard the investigation verdict and undercover reply that
+        # already succeeded.
 
-        report_result = ReportAgent().run(
-            investigation=investigation_result,
-            conversation=conversation_result
-        )
+        report_error = None
+        report_result = state_data.get("report")
 
-        state_data["report"] = report_result
+        try:
+
+            report_result = ReportAgent().run(
+                investigation=investigation_result,
+                conversation=conversation_result
+            )
+
+            state_data["report"] = report_result
+
+        except Exception as report_exc:
+
+            report_error = str(report_exc)
+
+            logger.warning(
+                "Report generation failed for session %s; returning the "
+                "investigation and reply without a report: %s",
+                session_id,
+                report_exc,
+            )
 
         # --------------------------------------------------
         # 5b. Best-effort export to the connected Google apps
         # --------------------------------------------------
         # Only runs when Drive / Sheets report a genuine, health-verified
         # session; otherwise each app is reported as "skipped". Failures
-        # are logged and never break the investigation.
+        # are logged and never break the investigation. The Drive export
+        # also skips itself when report_result is None.
 
         archive_result = EvidenceArchiver().export(
             case_id=session_id,
@@ -1257,17 +1286,82 @@ def analyze(request: InvestigationRequest):
                 "expected_outcome": (
                     conversation_result.expected_outcome
                 ),
+                "objective_achieved": (
+                    conversation_result.objective_achieved
+                ),
                 "messages": formatted_messages
             },
 
-            "report": {
-                "title": report_result.title,
-                "markdown": report_result.markdown
-            },
+            "report": (
+                {
+                    "title": report_result.title,
+                    "markdown": report_result.markdown
+                }
+                if report_result is not None
+                else None
+            ),
+
+            # Present but non-fatal when only the optional report call failed.
+            "warnings": (
+                [
+                    {
+                        "status": "report_unavailable",
+                        "message": (
+                            "Investigation and reply succeeded, but the AI "
+                            "report could not be generated this turn."
+                        )
+                    }
+                ]
+                if report_error
+                else []
+            ),
 
             # Honest per-app export outcome for this turn (Drive/Sheets).
             "archive": archive_result
         }
+
+    except HTTPException:
+        raise
+
+    except LLMNotConfiguredError as e:
+
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "status": "llm_not_configured",
+                "message": str(e),
+            }
+        )
+
+    except (RuntimeError, TimeoutError, ConnectionError) as e:
+
+        logger.error("AI provider failure during analysis: %s", e)
+        logger.error(traceback.format_exc())
+
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "status": "ai_provider_failed",
+                "message": (
+                    "The AI provider did not complete the investigation. "
+                    "Check OPENROUTER_API_KEY, LLM_MODEL, provider status, "
+                    f"and server network access. Details: {str(e)}"
+                ),
+            }
+        )
+
+    except ValueError as e:
+
+        logger.error("Invalid AI response during analysis: %s", e)
+        logger.error(traceback.format_exc())
+
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "status": "invalid_ai_response",
+                "message": f"The AI provider returned an unusable response: {str(e)}",
+            }
+        )
 
     except Exception as e:
 
@@ -1281,7 +1375,10 @@ def analyze(request: InvestigationRequest):
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error executing investigation: {str(e)}"
+            detail={
+                "status": "analysis_failed",
+                "message": f"Error executing investigation: {str(e)}",
+            }
         )
 
 

@@ -250,6 +250,19 @@ Return ONLY valid JSON.
                     f"Missing '{key}' in LLM response."
                 )
 
+        # Models should return a real boolean, but tolerate quoted
+        # truthy/falsy values without letting Pydantic surface a raw type
+        # error. Missing values safely default to False (do not advance
+        # the evidence ladder on uncertain output).
+        if "objective_achieved" in result:
+            value = result["objective_achieved"]
+            if isinstance(value, str):
+                result["objective_achieved"] = (
+                    value.strip().lower() in {"true", "yes", "1"}
+                )
+            elif not isinstance(value, bool):
+                result["objective_achieved"] = bool(value)
+
         return ConversationResult(
             **result
         )

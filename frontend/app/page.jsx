@@ -24,7 +24,7 @@ import OverviewPanel from '@/components/OverviewPanel';
 import ReportModal from '@/components/ReportModal';
 import IntegrationsModal from '@/components/IntegrationsModal';
 import ErrorToast from '@/components/ErrorToast';
-import { apiUrl } from '@/lib/api';
+import { apiFetch } from '@/lib/api';
 import { INITIAL_DASHBOARD_DATA, THINKING_STEPS } from '@/lib/constants';
 
 // Creates a unique id per investigation so backend sessions never
@@ -151,15 +151,11 @@ export default function DashboardPage() {
     });
 
     try {
-      const response = await fetch(apiUrl('/analyze'), {
+      const response = await apiFetch('/analyze', {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message, session_id: sessionId })
       });
-
-      if (!response.ok) {
-        throw new Error(`Server returned status ${response.status}`);
-      }
 
       const data = await response.json();
 
@@ -176,7 +172,10 @@ export default function DashboardPage() {
       }));
     } catch (err) {
       console.error("Analysis request error:", err);
-      setErrorMessage("Undercover trace failed. Verify API connectivity.");
+      setErrorMessage(
+        err?.message ||
+          "Undercover trace failed. Verify that the backend and AI provider are reachable."
+      );
     } finally {
       setIsThinking(false);
       setIsLoading(false);
@@ -191,7 +190,7 @@ export default function DashboardPage() {
     try {
       // Best effort: backend session is cleared so a future /analyze
       // with the SAME id starts fresh (we also rotate the id anyway).
-      await fetch(apiUrl('/new'), {
+      await apiFetch('/new', {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId })

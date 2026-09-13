@@ -137,9 +137,12 @@ class StubInvestigationAgent:
 class StubConversationAgent:
     """Stands in for ``ConversationAgent.run_telegram()``."""
 
-    def __init__(self, replies=None):
+    def __init__(self, replies=None, objective_achievements=None):
 
         self._replies = list(replies or [])
+        self._objective_achievements = list(
+            objective_achievements or []
+        )
         self.calls = []
 
     def run_telegram(
@@ -170,10 +173,21 @@ class StubConversationAgent:
         else:
             reply = self._replies[0]
 
+        if self._objective_achievements:
+            achieved = self._objective_achievements[0]
+            if len(self._objective_achievements) > 1:
+                self._objective_achievements.pop(0)
+        else:
+            # The first canned turn has no evidence yet. Later scripted
+            # turns satisfy the objective so the ladder test stays
+            # deterministic unless a test explicitly overrides this.
+            achieved = len(self.calls) > 1
+
         return ConversationResult(
             reply=reply,
             objective=investigation_state.current_objective,
             expected_outcome="Scammer explains the verification step.",
+            objective_achieved=achieved,
         )
 
 
@@ -377,13 +391,17 @@ def build_service(
     investigation_results=None,
     replies=None,
     archive=True,
+    objective_achievements=None,
 ) -> tuple:
     """A real service wired to stub agents (no LLM, no filesystem)."""
 
     investigation_agent = StubInvestigationAgent(
         investigation_results
     )
-    conversation_agent = StubConversationAgent(replies)
+    conversation_agent = StubConversationAgent(
+        replies,
+        objective_achievements=objective_achievements,
+    )
     memory_manager = StubMemoryManager()
 
     service = TelegramConversationService(
@@ -431,6 +449,7 @@ class TestTelegramAssistantPrompt(unittest.TestCase):
         self.assertIn('"reply"', prompt)
         self.assertIn('"objective"', prompt)
         self.assertIn('"expected_outcome"', prompt)
+        self.assertIn('"objective_achieved"', prompt)
         self.assertIn("Return ONLY JSON", prompt)
 
     def test_telegram_prompt_is_distinct_from_dashboard_prompt(self):
@@ -704,6 +723,24 @@ class TestConversationService(unittest.TestCase):
         self.assertEqual(first["strategy"], "Curious")
         self.assertEqual(second["strategy"], "Confused")
         self.assertEqual(third["strategy"], "Cooperative")
+
+    def test_objective_does_not_advance_without_evidence(self):
+        """A refusal or continuation must not jump objectives."""
+
+        service, _, _, _ = build_service(
+            objective_achievements=[False, False, False]
+        )
+
+        first = service.handle_message(42, "Your card is blocked")
+        second = service.handle_message(42, "Send your OTP now")
+        third = service.handle_message(42, "Why are you delaying?")
+
+        for result in (first, second, third):
+            self.assertEqual(
+                result["current_objective"],
+                "Collect official verification website",
+            )
+            self.assertFalse(result["objective_achieved"])
 
     def test_transcript_records_both_sides(self):
         """
