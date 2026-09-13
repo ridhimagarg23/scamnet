@@ -28,16 +28,28 @@ from utils.schemas import InvestigationResult
 
 class InvestigationAgent:
 
-    def __init__(self):
+    def __init__(
+        self,
+        provider: str | None = None,
+        model: str | None = None,
+    ):
         """
         Prepare the LLM client and load the investigation prompt.
 
         The prompt (``prompts/investigation_prompt.txt``) encodes the
         agent's system behaviour: detect phishing/fraud/impersonation
         tactics and answer with strict JSON only.
+
+        Parameters
+        ----------
+        provider : str | None
+            ``"openrouter"`` / ``"nvidia"`` override. ``None`` uses the
+            runtime-active provider.
+        model : str | None
+            Explicit model id override. ``None`` uses the active model.
         """
 
-        self.llm = LLMClient()
+        self.llm = LLMClient(provider=provider, model=model)
 
         self.prompt = PromptLoader.load(
             "investigation_prompt.txt"

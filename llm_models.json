@@ -1,0 +1,43 @@
+{
+  "_help": "EXTRA LLM models for the dashboard picker. Paste NVIDIA NIM model ids fetched from https://build.nvidia.com (or GET <NVIDIA_NIM_BASE_URL>/models) into the 'nvidia' list. Entries can be plain ids (\"org/model-id\") or objects with id/label/description/speed. This file EXTENDS the built-in catalog in llm/model_catalog.py - it is safe to leave entries here forever. Unknown shapes never crash the server (they are ignored with a log line). A {\"models\": {...}} wrapper is also accepted.",
+  "nvidia": [
+    {
+      "id": "meta/llama-3.1-8b-instruct",
+      "label": "Llama 3.1 8B Instruct",
+      "description": "Lightning-fast default for scam chat. Best latency.",
+      "speed": "lightning"
+    },
+    {
+      "id": "mistralai/mistral-7b-instruct-v0.3",
+      "label": "Mistral 7B Instruct v0.3",
+      "description": "Very fast small model, great fallback.",
+      "speed": "lightning"
+    },
+    {
+      "id": "google/gemma-2-9b-it",
+      "label": "Gemma 2 9B IT",
+      "description": "Fast instruction-tuned model, strong JSON output.",
+      "speed": "fast"
+    },
+    {
+      "id": "meta/llama-3.1-70b-instruct",
+      "label": "Llama 3.1 70B Instruct",
+      "description": "High-quality large model for hard verdicts.",
+      "speed": "balanced"
+    }
+  ],
+  "openrouter": [
+    {
+      "id": "qwen/qwen3-32b",
+      "label": "Qwen3 32B",
+      "description": "Default OpenRouter model. Strong structured output.",
+      "speed": "balanced"
+    },
+    {
+      "id": "meta-llama/llama-3.1-8b-instruct",
+      "label": "Llama 3.1 8B (OpenRouter)",
+      "description": "Fast + cheap fallback for quick turns.",
+      "speed": "fast"
+    }
+  ]
+}

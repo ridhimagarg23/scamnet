@@ -50,8 +50,14 @@ from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from config import settings
+from config import normalize_provider, settings
 from llm.llm_client import LLMNotConfiguredError
+from llm.model_catalog import (
+    describe_model,
+    fetch_live_models,
+    get_models,
+    is_known_model,
+)
 
 from agents.investigation_agent import InvestigationAgent
 from agents.conversation_agent import ConversationAgent
@@ -174,6 +180,22 @@ class InvestigationRequest(BaseModel):
     session_id: Optional[str] = "default"
     """Identifies the undercover conversation (state continuity)."""
 
+    provider: Optional[str] = None
+    """Optional per-request LLM provider (``openrouter`` / ``nvidia``)."""
+
+    model: Optional[str] = None
+    """Optional per-request LLM model id (any non-empty string works)."""
+
+
+class LLMSelectRequest(BaseModel):
+    """Request body for POST /api/llm/select (dashboard model picker)."""
+
+    provider: str
+    """Provider to activate (``openrouter`` / ``nvidia``)."""
+
+    model: Optional[str] = None
+    """Model id to activate (defaults to the provider's default)."""
+
 
 # --------------------------------------------------
 # Helper Functions
@@ -201,6 +223,24 @@ def _log_stage(session_id: str, name: str, started: float) -> float:
     )
 
     return now
+
+
+def _llm_stage_info(agent) -> dict:
+    """
+    Secret-free snapshot of which provider/model answered one stage.
+
+    The LLMClient falls back across spare models (and providers) on
+    failure, so the model that ANSWERED can differ from the requested
+    one - the dashboard shows this so "why so fast/slow?" is answerable.
+    """
+
+    llm = getattr(agent, "llm", None)
+
+    return {
+        "provider": getattr(llm, "last_provider", None),
+        "model": getattr(llm, "last_model", None),
+        "fallbacks_tried": len(getattr(llm, "fallbacks_used", None) or []),
+    }
 
 
 def get_persona_profile(threat_type: str, state) -> dict:
@@ -481,9 +521,9 @@ def health():
     """
     Liveness probe, plus an honest view of what the server can do.
 
-    ``status`` is ``healthy`` when the LLM key is configured and
-    ``degraded`` when it is not - the server still serves the
-    dashboard, ``/api/integrations`` and every integration connect
+    ``status`` is ``healthy`` when at least one LLM provider key is
+    configured and ``degraded`` when none is - the server still serves
+    the dashboard, ``/api/integrations`` and every integration connect
     attempt, so an operator can verify the external-app setup first.
     """
 
@@ -492,8 +532,210 @@ def health():
     return {
         "status": "healthy" if llm_configured else "degraded",
         "llm_configured": llm_configured,
-        "llm_model": settings.LLM_MODEL if llm_configured else None,
+        "llm_model": settings.ACTIVE_MODEL if llm_configured else None,
+        "active_provider": settings.ACTIVE_PROVIDER,
+        "active_model": settings.ACTIVE_MODEL,
+        "providers": {
+            "openrouter": {
+                "configured": settings.openrouter_configured,
+                "default_model": settings.get_default_model("openrouter"),
+            },
+            "nvidia": {
+                "configured": settings.nvidia_configured,
+                "default_model": settings.get_default_model("nvidia"),
+            },
+        },
     }
+
+
+# --------------------------------------------------
+# LLM provider / model selection endpoints
+# --------------------------------------------------
+# The dashboard's model picker is driven by these three endpoints.
+# Responses NEVER contain secret values - only key presence, model
+# ids and human-readable hints.
+
+def _llm_status_payload() -> dict:
+    """Secret-free snapshot of the LLM provider selection state."""
+
+    return {
+        "active_provider": settings.ACTIVE_PROVIDER,
+        "active_model": settings.ACTIVE_MODEL,
+        "active_model_info": describe_model(
+            settings.ACTIVE_PROVIDER, settings.ACTIVE_MODEL
+        ),
+        "llm_configured": settings.llm_configured,
+        "cross_provider_fallback": settings.LLM_CROSS_PROVIDER_FALLBACK,
+        "providers": {
+            "openrouter": {
+                "id": "openrouter",
+                "label": "OpenRouter",
+                "configured": settings.openrouter_configured,
+                "key_name": "OPENROUTER_API_KEY",
+                "base_url": settings.get_base_url("openrouter"),
+                "default_model": settings.get_default_model("openrouter"),
+                "fallback_models": settings.get_fallback_models("openrouter"),
+                "timeout": settings.get_timeout("openrouter"),
+            },
+            "nvidia": {
+                "id": "nvidia",
+                "label": "NVIDIA NIM",
+                "tagline": "Lightning-fast replies",
+                "configured": settings.nvidia_configured,
+                "key_name": "NVIDIA_NIM_API_KEY",
+                "base_url": settings.get_base_url("nvidia"),
+                "default_model": settings.get_default_model("nvidia"),
+                "fallback_models": settings.get_fallback_models("nvidia"),
+                "timeout": settings.get_timeout("nvidia"),
+            },
+        },
+    }
+
+
+@app.get("/api/llm/status")
+def llm_status():
+    """
+    Returns the active LLM provider/model plus per-provider status.
+
+    The dashboard calls this on load to render the provider toggle and
+    the model dropdown in the correct state.
+    """
+
+    return _llm_status_payload()
+
+
+@app.get("/api/llm/models")
+def llm_models(provider: Optional[str] = None, refresh: bool = False):
+    """
+    Returns the model catalog for one provider (dashboard picker).
+
+    Query parameters
+    ----------------
+    provider : str, optional
+        ``openrouter`` or ``nvidia`` (default: the active provider).
+    refresh : bool, default False
+        When true, query the provider's live ``/models`` endpoint first
+        (needs the provider key for NVIDIA NIM); on any failure the
+        curated catalog is returned instead with ``source`` explaining
+        what happened - this endpoint never answers 5xx for a provider
+        hiccup.
+    """
+
+    normalized = normalize_provider(provider) or settings.ACTIVE_PROVIDER
+
+    if not settings.is_known_provider(normalized):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "status": "unknown_llm_provider",
+                "message": (
+                    f"Unknown LLM provider '{provider}'. "
+                    "Use 'openrouter' or 'nvidia'."
+                ),
+            },
+        )
+
+    models = get_models(normalized)
+    source = "catalog"
+
+    if refresh:
+        live_models, live_source = fetch_live_models(
+            normalized, force_refresh=True
+        )
+
+        if live_models:
+            models = live_models
+            source = live_source
+        else:
+            source = f"catalog ({live_source})"
+
+    return {
+        "provider": normalized,
+        "configured": settings.is_provider_configured(normalized),
+        "key_name": settings.provider_key_name(normalized),
+        "active_model": (
+            settings.ACTIVE_MODEL
+            if normalized == settings.ACTIVE_PROVIDER
+            else settings.get_default_model(normalized)
+        ),
+        "default_model": settings.get_default_model(normalized),
+        "fallback_models": settings.get_fallback_models(normalized),
+        "models": models,
+        "source": source,
+    }
+
+
+@app.post("/api/llm/select")
+def llm_select(request: LLMSelectRequest):
+    """
+    Switches the runtime-active LLM provider/model (dashboard picker).
+
+    Any non-empty model id is accepted (new NIM releases work without
+    a catalog update); unknown ids are flagged via ``model_known`` so
+    the UI can show a gentle hint instead of blocking the user.
+    """
+
+    provider = normalize_provider(request.provider)
+
+    if not settings.is_known_provider(provider):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "status": "unknown_llm_provider",
+                "message": (
+                    f"Unknown LLM provider '{request.provider}'. "
+                    "Use 'openrouter' or 'nvidia'."
+                ),
+            },
+        )
+
+    if not settings.is_provider_configured(provider):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "status": "llm_provider_not_configured",
+                "message": (
+                    f"{settings.provider_key_name(provider)} is not set "
+                    "on the server, so the provider cannot be activated. "
+                    "Add it to the server-side .env (see .env.example) "
+                    "and restart the backend."
+                ),
+            },
+        )
+
+    requested_model = (request.model or "").strip() or None
+
+    try:
+        active_provider, active_model = settings.set_active(
+            provider, requested_model
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "status": "unknown_llm_provider",
+                "message": str(exc),
+            },
+        )
+
+    logger.info(
+        "LLM selection switched to provider '%s', model '%s'.",
+        active_provider,
+        active_model,
+    )
+
+    payload = _llm_status_payload()
+    payload["model_known"] = is_known_model(active_provider, active_model)
+
+    if not payload["model_known"]:
+        payload["model_hint"] = (
+            f"Model '{active_model}' is not in the curated catalog - it "
+            "will still be tried first, with automatic fallback to the "
+            "configured spare models if the provider rejects it. Add it "
+            "to llm_models.json to give it a friendly label."
+        )
+
+    return payload
 
 
 # --------------------------------------------------
@@ -840,12 +1082,37 @@ def analyze(request: InvestigationRequest):
             detail={
                 "status": "llm_not_configured",
                 "message": (
-                    "OPENROUTER_API_KEY is not set on the server, so the "
-                    "AI agents cannot run. Add it to the server-side "
-                    ".env (see .env.example) and restart the backend."
+                    "Neither OPENROUTER_API_KEY nor NVIDIA_NIM_API_KEY is "
+                    "set on the server, so the AI agents cannot run. Add "
+                    "at least one of them to the server-side .env (see "
+                    ".env.example) and restart the backend."
                 )
             }
         )
+
+    # Per-request LLM override (dashboard model picker): an explicit
+    # provider/model wins for THIS turn only; otherwise the
+    # runtime-active selection (POST /api/llm/select) is used.
+    requested_provider = (request.provider or "").strip() or None
+    requested_model = (request.model or "").strip() or None
+
+    if requested_provider and not settings.is_known_provider(
+        requested_provider
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "status": "unknown_llm_provider",
+                "message": (
+                    f"Unknown LLM provider '{requested_provider}'. "
+                    "Use 'openrouter' or 'nvidia'."
+                ),
+            },
+        )
+
+    llm_provider, llm_model = settings.resolve_provider_model(
+        requested_provider, requested_model
+    )
 
     logger.info(
         f"Processing message in session '{session_id}': "
@@ -896,7 +1163,10 @@ def analyze(request: InvestigationRequest):
         # --------------------------------------------------
 
         stage_started = time.perf_counter()
-        investigation_result = InvestigationAgent().run(message)
+        investigation_agent = InvestigationAgent(
+            provider=llm_provider, model=llm_model
+        )
+        investigation_result = investigation_agent.run(message)
         _log_stage(session_id, "investigation", stage_started)
 
         if state_data["investigation"] is None:
@@ -1075,7 +1345,10 @@ def analyze(request: InvestigationRequest):
         session.add_scammer_message(message)
 
         stage_started = time.perf_counter()
-        conversation_result = ConversationAgent().run(
+        conversation_agent = ConversationAgent(
+            provider=llm_provider, model=llm_model
+        )
+        conversation_result = conversation_agent.run(
             investigation=investigation_result,
             investigation_state=engine_state,
             latest_message=message,
@@ -1152,13 +1425,17 @@ def analyze(request: InvestigationRequest):
         # already succeeded.
 
         report_error = None
+        report_agent = None
         report_result = state_data.get("report")
 
         stage_started = time.perf_counter()
 
         try:
 
-            report_result = ReportAgent().run(
+            report_agent = ReportAgent(
+                provider=llm_provider, model=llm_model
+            )
+            report_result = report_agent.run(
                 investigation=investigation_result,
                 conversation=conversation_result
             )
@@ -1292,8 +1569,26 @@ def analyze(request: InvestigationRequest):
             session_id, time.perf_counter() - pipeline_started,
         )
 
+        # Which provider/model actually answered each stage (after any
+        # automatic fallbacks) - surfaced so the dashboard can show it.
+        conversation_llm = _llm_stage_info(conversation_agent)
+
+        llm_info = {
+            "requested_provider": llm_provider,
+            "requested_model": llm_model,
+            "provider": conversation_llm.get("provider") or llm_provider,
+            "model": conversation_llm.get("model") or llm_model,
+            "stages": {
+                "investigation": _llm_stage_info(investigation_agent),
+                "conversation": conversation_llm,
+                "report": _llm_stage_info(report_agent),
+            },
+        }
+
         return {
             "session_id": session_id,
+
+            "llm": llm_info,
 
             "investigation": {
                 "riskScore": investigation_result.risk_score,
@@ -1385,8 +1680,9 @@ def analyze(request: InvestigationRequest):
                 "status": "ai_provider_failed",
                 "message": (
                     "The AI provider did not complete the investigation. "
-                    "Check OPENROUTER_API_KEY, LLM_MODEL, provider status, "
-                    f"and server network access. Details: {str(e)}"
+                    "Check OPENROUTER_API_KEY / NVIDIA_NIM_API_KEY, the "
+                    "selected model (GET /api/llm/models), provider "
+                    f"status, and server network access. Details: {str(e)}"
                 ),
             }
         )
