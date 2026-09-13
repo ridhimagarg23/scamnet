@@ -3,9 +3,10 @@
 // API helpers for the SCAMNET "Connected Apps" (integrations) UI.
 //
 // SECURITY MODEL:
-//  * All requests go through the SAME-ORIGIN /backend-api/* proxy
-//    (see next.config.mjs rewrites + lib/api.js) - the browser never
-//    talks to the backend cross-origin and never sees credentials.
+//  * All requests go through lib/api.js - directly to the backend in
+//    local `run_all` runs, via the SAME-ORIGIN /backend-api/* proxy
+//    (next.config.mjs rewrites) when hosted. Either way the browser
+//    never sees credentials.
 //  * The backend only ever returns honest, secret-free status
 //    (integrations/base.py). The UI must never invent a "connected"
 //    state on its own: if the backend cannot be reached, the status

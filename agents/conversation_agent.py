@@ -227,9 +227,13 @@ Return ONLY valid JSON.
             If the LLM output is missing any required key.
         """
 
+        # The reply JSON is a short chat line plus two short phrases; the
+        # budget only bounds a slow or overly verbose model (dashboard and
+        # Telegram channels share this path).
         result = self.llm.generate(
             final_prompt,
-            json_output=True
+            json_output=True,
+            max_tokens=800,
         )
 
         # ----------------------------

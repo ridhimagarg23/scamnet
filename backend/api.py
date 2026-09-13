@@ -42,6 +42,7 @@ requests but resets when the process restarts.
 
 import datetime
 import logging
+import time
 import traceback
 from typing import Dict, Optional
 
@@ -180,6 +181,26 @@ class InvestigationRequest(BaseModel):
 
 def get_current_time_str() -> str:
     return datetime.datetime.now().strftime("%I:%M %p")
+
+
+def _log_stage(session_id: str, name: str, started: float) -> float:
+    """
+    Log how long one ``/analyze`` pipeline stage took.
+
+    A full turn runs three sequential LLM calls plus archiving, so a
+    slow model shows up here first (``investigation`` / ``conversation`` /
+    ``report`` each taking 10 s+). Returns the new timestamp so callers
+    can chain stages without re-reading the clock.
+    """
+
+    now = time.perf_counter()
+
+    logger.info(
+        "Session '%s': stage '%s' took %.1fs.",
+        session_id, name, now - started,
+    )
+
+    return now
 
 
 def get_persona_profile(threat_type: str, state) -> dict:
@@ -831,6 +852,8 @@ def analyze(request: InvestigationRequest):
         f"{message[:50]}..."
     )
 
+    pipeline_started = time.perf_counter()
+
     try:
 
         # --------------------------------------------------
@@ -872,7 +895,9 @@ def analyze(request: InvestigationRequest):
         # 2. Run core investigation agent
         # --------------------------------------------------
 
+        stage_started = time.perf_counter()
         investigation_result = InvestigationAgent().run(message)
+        _log_stage(session_id, "investigation", stage_started)
 
         if state_data["investigation"] is None:
 
@@ -1049,12 +1074,14 @@ def analyze(request: InvestigationRequest):
 
         session.add_scammer_message(message)
 
+        stage_started = time.perf_counter()
         conversation_result = ConversationAgent().run(
             investigation=investigation_result,
             investigation_state=engine_state,
             latest_message=message,
             conversation_history=session.get_history()
         )
+        _log_stage(session_id, "conversation", stage_started)
 
         # Keep the transcript complete for the next turn's prompt.
         session.add_traceai_reply(
@@ -1109,9 +1136,11 @@ def analyze(request: InvestigationRequest):
         # 4. Archive the case facts into threat memory (JSON)
         # --------------------------------------------------
 
+        stage_started = time.perf_counter()
         MemoryManager().save(
             investigation_result.model_dump()
         )
+        _log_stage(session_id, "memory", stage_started)
 
         # --------------------------------------------------
         # 5. Generate the latest investigation report
@@ -1124,6 +1153,8 @@ def analyze(request: InvestigationRequest):
 
         report_error = None
         report_result = state_data.get("report")
+
+        stage_started = time.perf_counter()
 
         try:
 
@@ -1145,6 +1176,9 @@ def analyze(request: InvestigationRequest):
                 report_exc,
             )
 
+        finally:
+            _log_stage(session_id, "report", stage_started)
+
         # --------------------------------------------------
         # 5b. Best-effort export to the connected Google apps
         # --------------------------------------------------
@@ -1153,12 +1187,14 @@ def analyze(request: InvestigationRequest):
         # are logged and never break the investigation. The Drive export
         # also skips itself when report_result is None.
 
+        stage_started = time.perf_counter()
         archive_result = EvidenceArchiver().export(
             case_id=session_id,
             investigation=investigation_result,
             report=report_result,
             drive_file_id=state_data.get("drive_file_id"),
         )
+        _log_stage(session_id, "archive", stage_started)
 
         state_data["drive_file_id"] = (
             archive_result["google_drive"].get("file_id")
@@ -1250,6 +1286,11 @@ def analyze(request: InvestigationRequest):
         # See frontend/lib/constants.js (INITIAL_DASHBOARD_DATA) for
         # the empty-state counterpart of these shapes.
         # --------------------------------------------------
+
+        logger.info(
+            "Session '%s': /analyze completed in %.1fs.",
+            session_id, time.perf_counter() - pipeline_started,
+        )
 
         return {
             "session_id": session_id,

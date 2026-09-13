@@ -18,6 +18,9 @@ What it does for you
   (it still starts - the backend runs in degraded mode without an LLM key);
 * runs ``npm install`` in ``frontend/`` the first time (skip with
   ``--skip-install``);
+* points the browser at FastAPI directly (``NEXT_PUBLIC_API_URL``) so
+  slow ``/analyze`` turns never hit the Next.js proxy's ~30 s ceiling
+  (opt out with ``--use-proxy``);
 * waits until each service actually answers before printing the URLs;
 * streams every log line prefixed with ``[api]`` / ``[ui]`` / ``[streamlit]``;
 * Ctrl+C (or a crash) stops every child process, including on Windows.
@@ -84,6 +87,84 @@ def port_is_open(port: int, host: str = "127.0.0.1") -> bool:
     with socket.socket() as probe:
         probe.settimeout(0.5)
         return probe.connect_ex((host, port)) == 0
+
+
+def local_lan_ip() -> str | None:
+    """
+    Best-effort LAN IPv4 of this machine (None when undetectable).
+
+    Used so the dashboard stays reachable when it is opened from another
+    device on the network (``http://<lan-ip>:3000``). No packet is ever
+    sent: ``connect()`` on a UDP socket only selects the outbound route.
+    """
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    try:
+        probe.connect(("8.8.8.8", 80))
+        ip = probe.getsockname()[0]
+        return ip if ip and not ip.startswith("127.") else None
+
+    except OSError:
+        return None
+
+    finally:
+        probe.close()
+
+
+def build_child_env(args) -> dict:
+    """
+    Build the environment for the backend + dashboard child processes.
+
+    Two backend URLs are configured, serving two different consumers:
+
+    * ``BACKEND_INTERNAL_URL`` - read by the Next.js *server*:
+      ``/backend-api/*`` is proxied here. Kept always, so the proxy path
+      (and every hosted deployment) keeps working as a fallback.
+    * ``NEXT_PUBLIC_API_URL`` - read by the *browser* code (lib/api.js).
+      Set to the backend so local runs call FastAPI directly.
+
+    Direct mode is the default because ``POST /analyze`` runs three
+    sequential LLM calls (~35-50 s on ``qwen/qwen3-32b``), while the
+    Next.js dev rewrite proxy drops proxied requests after ~30 s with
+    ``Failed to proxy ... socket hang up`` (ECONNRESET) - the backend
+    keeps working, but the dashboard reports a 500. Browser ``fetch``
+    has no such ceiling, so direct calls always survive a slow model.
+    Pass ``--use-proxy`` to restore the old proxied behaviour (useful
+    to reproduce the hosted path locally).
+
+    Direct browser calls are cross-origin, so ``CORS_ALLOW_ORIGINS`` is
+    pre-filled with the dashboard origin(s) on the actual frontend port
+    (localhost, 127.0.0.1 and the LAN IP) - unless the operator already
+    set it explicitly, which is always respected.
+    """
+
+    env = os.environ.copy()
+
+    backend_url = f"http://127.0.0.1:{args.backend_port}"
+
+    # The dashboard's Next server proxies /backend-api/* here.
+    env["BACKEND_INTERNAL_URL"] = backend_url
+
+    if args.use_proxy:
+        env.pop("NEXT_PUBLIC_API_URL", None)
+    else:
+        env["NEXT_PUBLIC_API_URL"] = backend_url
+
+    if not env.get("CORS_ALLOW_ORIGINS", "").strip():
+        origins = {
+            f"http://localhost:{args.frontend_port}",
+            f"http://127.0.0.1:{args.frontend_port}",
+        }
+        lan_ip = local_lan_ip()
+        if lan_ip:
+            origins.add(f"http://{lan_ip}:{args.frontend_port}")
+        env["CORS_ALLOW_ORIGINS"] = ",".join(sorted(origins))
+
+    # Make sure the backend can import the project when started elsewhere.
+    env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+
+    return env
 
 
 def read_env_file() -> dict:
@@ -338,6 +419,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="restart the backend automatically when Python files change",
     )
+    parser.add_argument(
+        "--use-proxy",
+        action="store_true",
+        help="route browser API calls through the Next.js /backend-api "
+        "proxy instead of calling the backend directly (reproduces the "
+        "hosted path; slow /analyze turns may hit the proxy timeout)",
+    )
 
     return parser
 
@@ -387,13 +475,11 @@ def main() -> int:
     # ----------------------------------------------------------
     # Environment for the children
     # ----------------------------------------------------------
-    env = os.environ.copy()
-
-    # The dashboard's Next server proxies /backend-api/* here.
-    env["BACKEND_INTERNAL_URL"] = f"http://127.0.0.1:{args.backend_port}"
-
-    # Make sure the backend can import the project when started elsewhere.
-    env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    # NEXT_PUBLIC_API_URL makes the browser call FastAPI directly
+    # (no 30 s proxy ceiling on slow /analyze turns); BACKEND_INTERNAL_URL
+    # keeps the /backend-api proxy working as a fallback. See
+    # build_child_env() for the full rationale.
+    env = build_child_env(args)
 
     services: list = []
 
@@ -415,9 +501,13 @@ def main() -> int:
         # ------------------------------------------------------
         # 1. Backend API
         # ------------------------------------------------------
+        # --timeout-keep-alive 60: the default (5 s) closes idle keep-alive
+        # connections so aggressively that a pooled proxy connection can be
+        # found dead on reuse (sporadic ECONNRESET on the /backend-api path).
         backend_command = [
             python, "-m", "uvicorn", "backend.api:app",
             "--host", "0.0.0.0", "--port", str(args.backend_port),
+            "--timeout-keep-alive", "60",
         ]
 
         if args.reload:
@@ -486,6 +576,13 @@ def main() -> int:
         print("=" * 68)
         print(f"  Dashboard      : http://localhost:{args.frontend_port}")
         print(f"  Backend API    : http://localhost:{args.backend_port}")
+        if env.get("NEXT_PUBLIC_API_URL"):
+            print(
+                "  API mode       : direct "
+                f"(browser -> {env['NEXT_PUBLIC_API_URL']})"
+            )
+        else:
+            print("  API mode       : proxy (browser -> /backend-api -> backend)")
         print(f"  Health check   : http://localhost:{args.backend_port}/health")
         print(
             "  Telegram status: "

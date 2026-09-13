@@ -95,6 +95,7 @@ class LLMClient:
         temperature: float = 0.2,
         json_output: bool = False,
         retries: int = 3,
+        max_tokens: int | None = None,
     ) -> str | dict[str, Any]:
         """
         Run one chat-completion call and return the model output.
@@ -111,6 +112,12 @@ class LLMClient:
         retries : int, default 3
             Number of attempts before giving up on transient errors.
             Wait time backs off exponentially (2 ** attempt seconds).
+        max_tokens : int | None, default None
+            Hard cap on the generated completion. Every agent passes a
+            budget matched to its output shape (small JSON verdicts need
+            far fewer tokens than the markdown report) so a slow or
+            verbose model cannot stall ``POST /analyze`` - or the
+            per-token bill - without bound. Omit (None) for uncapped.
 
         Returns
         -------
@@ -156,6 +163,9 @@ class LLMClient:
                     request_kwargs["response_format"] = {
                         "type": "json_object"
                     }
+
+                if max_tokens is not None:
+                    request_kwargs["max_tokens"] = max_tokens
 
                 response = self.client.chat.completions.create(
                     **request_kwargs
