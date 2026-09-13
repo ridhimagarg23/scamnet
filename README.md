@@ -244,38 +244,82 @@ GOOGLE_DRIVE_FOLDER_ID=1XyZ...
 
 ## 🚀 Getting Started
 
+> **TL;DR:** after the one-time setup below, run everything with
+> **`python scripts/run_all.py`** (Windows: double-click `run_all.bat`).
+
 ### Prerequisites
 - Python 3.10+
 - Node 18+ (for the dashboard)
 - Git
 
-### 1. Clone & configure
+### 1. Clone & configure (once)
 
 ```bash
 git clone <repo-url>
 cd TraceAI
 
-python3 -m venv venv
-source venv/bin/activate          # Windows: venv\Scripts\activate
+python3 -m venv .venv
+source .venv/bin/activate         # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env              # then add your OpenRouter key
+
+cp .env.example .env              # Windows: copy .env.example .env
+# then put your keys in .env (see below)
 ```
 
-### 2. Run the backend
+`.env` lives **at the repository root** (next to `config.py`) and is git-ignored.
+The two keys that matter:
+
+| Variable | What it enables | Where to get it |
+|---|---|---|
+| `OPENROUTER_API_KEY` | the AI agents (`/analyze`, Telegram replies, reports) | https://openrouter.ai/keys |
+| `TELEGRAM_BOT_TOKEN` | the Telegram bot | Telegram → **@BotFather** → `/newbot` |
+
+Without the LLM key the server still boots and serves the dashboard and the
+integrations page (`/health` reports `degraded`, agent endpoints answer `503`).
+`TELEGRAM_API_BASE` stays **empty** for real Telegram (it only exists to point at
+`scripts/telegram_simulator.py`). The dashboard needs no keys - it talks to the
+backend through the same-origin `/backend-api` proxy.
+
+### 2. Run the whole project
 
 ```bash
-python -m backend.api
-# FastAPI server on http://127.0.0.1:8001
+python scripts/run_all.py          # backend + dashboard
 ```
 
-### 3. Run the frontend dashboard
+Windows users can double-click **`run_all.bat`**; Linux/macOS: **`./run_all.sh`**.
+Both accept the same flags:
 
-```bash
-cd frontend
-npm install
-npm run dev
-# Dashboard on http://127.0.0.1:3000
+| Flag | Effect |
+|---|---|
+| `--streamlit` | also start the Streamlit UI on `:8501` |
+| `--no-frontend` | backend only (no Node needed) |
+| `--reload` | restart the backend when Python files change |
+| `--backend-port N` / `--frontend-port N` | use other ports (default `8001` / `3000`) |
+| `--skip-install` | never run `npm install` |
+
+The launcher prints a readiness report (missing keys, degraded mode), installs
+dashboard dependencies the first time, waits until each service really answers,
+prefixes every log line (`[api]`, `[ui]`, `[streamlit]`) and stops everything on
+**Ctrl+C**.
+
 ```
+  Dashboard      : http://localhost:3000
+  Backend API    : http://localhost:8001
+  Health check   : http://localhost:8001/health
+  Telegram status: http://localhost:8001/api/telegram/conversation/status
+```
+
+### 3. Use it
+
+Open the dashboard, click the **paste-template** icon (or type a scam SMS such as
+*"Dear SBI customer, your card is blocked. Verify at http://sbi-secure-login.co.in"*)
+and press **Send**.
+
+With `TELEGRAM_BOT_TOKEN` set, the bot connects **and starts replying on boot** -
+check **Connected Apps → Telegram** in the dashboard (the card shows the loop
+running, with Start/Stop and a "send test hello" box), or message the bot from
+Telegram: `/start` gets an instant greeting, any other message gets investigated
+and answered by the persona.
 
 Open the dashboard, click the **paste-template** icon (or type a scam SMS such as *"Dear SBI customer, your card is blocked. Verify at http://sbi-secure-login.co.in"*) and press **Send**.
 
