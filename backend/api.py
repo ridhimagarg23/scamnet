@@ -4,11 +4,25 @@ api.py
 TraceAI Production FastAPI Backend
 
 This is the HTTP surface of the whole platform. The Next.js dashboard
-talks to three endpoints:
+talks to these endpoints:
 
     POST /analyze   - feed one scammer message into the pipeline
     POST /new       - reset a session (start a fresh case)
     GET  /health    - liveness probe for hosting platforms
+
+    GET  /api/integrations                    - honest status of the
+                                                external-app integration
+                                                layer (SCAMNET)
+    POST /api/integrations/{id}/connect       - attempt a real connect
+                                                (Telegram: getMe verify;
+                                                501 while a provider's
+                                                auth flow is not built)
+
+    GET  /api/telegram/messages               - fetch recent incoming
+                                                Telegram messages (test)
+    POST /api/telegram/send-test              - send one test message
+                                                to a chat_id
+                                                (see backend/telegram_routes.py)
 
 One /analyze turn runs this pipeline:
 
@@ -45,6 +59,18 @@ from tools.memory_manager import MemoryManager
 from tools.entity_extractor import EntityExtractor
 from tools.url_checker import URLChecker
 from tools.risk_engine import RiskEngine
+
+from integrations import (
+    get_all_integration_statuses,
+    get_integration,
+)
+from integrations.base import (
+    IntegrationConnectionError,
+    IntegrationNotConfiguredError,
+    IntegrationNotImplementedError,
+)
+
+from backend.telegram_routes import router as telegram_router
 
 
 # --------------------------------------------------
@@ -83,6 +109,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# --------------------------------------------------
+# Register integration sub-routers
+# --------------------------------------------------
+# Telegram test endpoints (GET /api/telegram/messages,
+# POST /api/telegram/send-test) live in backend/telegram_routes.py.
+
+app.include_router(telegram_router)
 
 
 
@@ -399,6 +434,111 @@ def health():
     return {
         "status": "healthy"
     }
+
+
+# --------------------------------------------------
+# SCAMNET Integration Endpoints
+# --------------------------------------------------
+# Honest status of the external-app integration layer
+# (Telegram / Google Sheets / Google Drive - see integrations/).
+#
+# Contract:
+#   * responses NEVER contain secret values (only setting names and
+#     human-readable state descriptions);
+#   * ``connected`` is only ever true after a REAL authenticated
+#     session was established and health-verified server-side;
+#   * while an auth flow is not implemented, connect attempts answer
+#     HTTP 501 ("setup_required") instead of faking success.
+
+@app.get("/api/integrations")
+def integrations_status():
+    """
+    Returns the real configuration/authentication status of every
+    registered integration, keyed by integration id:
+
+        {
+          "telegram":      {"available": bool, "connected": bool, ...},
+          "google_sheets": {"available": bool, "connected": bool, ...},
+          "google_drive":  {"available": bool, "connected": bool, ...}
+        }
+
+    Each value also carries name/purpose/configured/state/detail/
+    setup_instructions for the dashboard's Connected Apps UI.
+    """
+
+    return get_all_integration_statuses()
+
+
+@app.post("/api/integrations/{integration_id}/connect")
+def integrations_connect(integration_id: str):
+    """
+    Attempts to establish a REAL connection for one integration.
+
+    Honest outcomes (no fake success states):
+      404 - unknown integration id
+      409 - server-side credentials missing/invalid ("not_configured")
+      501 - credentials present but the auth flow is not implemented
+            yet ("setup_required" - Google Sheets / Google Drive)
+      502 - a real connection attempt failed ("connection_failed" -
+            e.g. Telegram rejected the token or the network is down;
+            the message is sanitised and never contains the token)
+      200 - a genuine authenticated connection was established; the
+            fresh IntegrationStatus payload is returned. For Telegram
+            this means getMe verified the bot (e.g. @scamnet_intel_bot).
+    """
+
+    integration = get_integration(integration_id)
+
+    if integration is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Unknown integration '{integration_id}'."
+        )
+
+    logger.info(
+        f"Connect requested for integration '{integration_id}'."
+    )
+
+    try:
+        integration.connect()
+
+    except IntegrationNotConfiguredError as exc:
+        # Credential problem: the operator must configure the server
+        # .env first. The message names settings only - never values.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "status": "not_configured",
+                "message": str(exc)
+            }
+        )
+
+    except IntegrationNotImplementedError as exc:
+        # The real auth flow does not exist yet. 501 makes "not built"
+        # indistinguishable-from-success impossible for any client.
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail={
+                "status": "setup_required",
+                "message": str(exc)
+            }
+        )
+
+    except IntegrationConnectionError as exc:
+        # A REAL attempt was made and failed (Telegram rejected the
+        # token, network unreachable, upstream error). The message was
+        # sanitised by the provider client - no token, no request URL.
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "status": "connection_failed",
+                "message": str(exc)
+            }
+        )
+
+    # Reached only when connect() performed a real, verified handshake.
+    return integration.get_status().model_dump(mode="json")
+
 
 @app.options("/new")
 def new_options():

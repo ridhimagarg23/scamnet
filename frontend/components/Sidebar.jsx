@@ -3,11 +3,14 @@
 // Left navigation rail:
 //  * Logo + product name
 //  * "New Investigation" primary action
-//  * Nav links (Dashboard / History / Saved Cases / Reports)
+//  * Nav links (Dashboard / History / Saved Cases / Reports /
+//    Connected Apps)
 //  * Footer with a safety shield card + dark-mode toggle
 //
 // History / Saved Cases are future features: clicking them bubbles
 // up through onShowNotImplemented (alert stub in page.jsx).
+// Connected Apps opens the SCAMNET IntegrationsModal (honest external
+// app connection status - Telegram / Google Sheets / Google Drive).
 // -------------------------------------------------------------------
 
 import React from 'react';
@@ -16,6 +19,7 @@ import { ShieldIcon } from './Icons';
 export default function Sidebar({
   onNewInvestigation,
   onGenerateReport,
+  onShowIntegrations,
   onShowNotImplemented,
   isDark,
   onToggleDark
@@ -79,6 +83,16 @@ export default function Sidebar({
           <line x1="8" y1="12" x2="16" y2="12" />
         </svg>
         <span>Reports</span>
+      </button>
+
+      {/* Connected Apps: SCAMNET integrations status (Telegram /
+          Google Sheets / Google Drive) - opens the IntegrationsModal */}
+      <button className="nav-item" type="button" onClick={onShowIntegrations}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+          <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+        </svg>
+        <span>Connected Apps</span>
       </button>
 
       <div className="sidebar-footer">

@@ -11,6 +11,12 @@ venv/
 # Local DB & Session States
 database/threat_memory.json
 
+# Integration credentials & tokens (NEVER commit real secrets)
+credentials/
+*service_account*.json
+*service-account*.json
+*token*.json
+
 # Local Logs
 logs/
 *.log
