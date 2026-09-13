@@ -25,6 +25,10 @@ Optional environment variables
 ------------------------------
 * ``LLM_MODEL``           - OpenRouter model id used by every agent.
                             Defaults to ``qwen/qwen3-32b``.
+* ``OPENROUTER_BASE_URL`` - OpenAI-compatible gateway root.
+                            Defaults to ``https://openrouter.ai/api/v1``;
+                            override it for a self-hosted gateway
+                            (vLLM, Ollama, LiteLLM) or a test double.
 * ``CORS_ALLOW_ORIGINS``  - Comma-separated browser origins allowed to
                             call the API cross-origin. Defaults to the
                             local dev origins + the hosted dashboard.
@@ -80,6 +84,27 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+# Truthy spellings accepted for boolean environment flags.
+_TRUE_VALUES = ("1", "true", "yes", "on")
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """
+    Read a boolean environment flag.
+
+    ``TELEGRAM_AUTO_START_WORKER=0`` / ``false`` / ``no`` / ``off``
+    (any case, surrounding spaces ignored) disable the flag; an unset
+    variable keeps ``default``.
+    """
+
+    raw = os.getenv(name)
+
+    if raw is None or not raw.strip():
+        return default
+
+    return raw.strip().lower() in _TRUE_VALUES
+
+
 class Settings:
     """
     Container of all runtime configuration values.
@@ -127,6 +152,14 @@ class Settings:
             "qwen/qwen3-32b"
         )
 
+        # OpenAI-compatible gateway root. OpenRouter by default; a
+        # self-hosted gateway (vLLM / Ollama / LiteLLM) or a local test
+        # double only needs this one variable to be overridden.
+        self.OPENROUTER_BASE_URL = os.getenv(
+            "OPENROUTER_BASE_URL",
+            "https://openrouter.ai/api/v1"
+        ).rstrip("/")
+
         # ------------------------------------------------------
         # SCAMNET external-app integrations (all OPTIONAL)
         # ------------------------------------------------------
@@ -149,6 +182,14 @@ class Settings:
         self.TELEGRAM_API_BASE = os.getenv(
             "TELEGRAM_API_BASE",
             "https://api.telegram.org"
+        )
+
+        # Start the Telegram reply loop automatically once the bot is
+        # connected (and at boot when the token already works). Set to
+        # 0 to require an explicit POST /api/telegram/conversation/start
+        # - useful when another service owns the getUpdates cursor.
+        self.TELEGRAM_AUTO_START_WORKER = _env_flag(
+            "TELEGRAM_AUTO_START_WORKER", True
         )
 
         # --- Shared Google credentials (optional convenience) ---

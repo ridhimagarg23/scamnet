@@ -52,6 +52,61 @@ from utils.schemas import InvestigationResult
 logger = logging.getLogger("SCAMNET-ConversationService")
 
 
+# ----------------------------------------------------------
+# Bot commands (handled WITHOUT the LLM)
+# ----------------------------------------------------------
+# ``/start`` is what Telegram itself sends when a chat opens a bot for
+# the first time, and it is the one message an operator can always send
+# to check that the loop is alive. It must therefore never depend on
+# the LLM provider: the worker answers it with a fixed, cover-safe
+# greeting (see ``TelegramConversationWorker``).
+START_COMMAND = "/start"
+
+# Cover-safe liveness greeting. It deliberately does NOT mention
+# investigations, SCAMNET, evidence or personas: a scammer who taps
+# /start only sees a normal, friendly bot greeting.
+START_GREETING = (
+    "\U0001F44B Hi! You are connected. Send me a message and I will reply."
+)
+
+# Longest bot-command suffix Telegram may append ("/start@my_bot").
+_COMMAND_SUFFIX = "@"
+
+
+def normalize_command(text: str) -> str:
+    """
+    Normalize a bot command for comparison.
+
+    ``"/START"``, ``"/start"`` and ``"/start@scamnet_intel_bot"`` all
+    normalize to ``"/start"`` - Telegram sends the group-chat form
+    (with the bot username) whenever the chat is a group.
+
+    Returns an empty string for non-command text.
+    """
+
+    if not isinstance(text, str):
+        return ""
+
+    candidate = text.strip()
+
+    if not candidate.startswith("/"):
+        return ""
+
+    # Only the first token is the command ("/start hello" -> "/start").
+    candidate = candidate.split()[0].lower()
+
+    if _COMMAND_SUFFIX in candidate:
+        candidate = candidate.split(_COMMAND_SUFFIX, 1)[0]
+
+    return candidate
+
+
+def is_start_command(text: str) -> bool:
+    """True when ``text`` is ``/start`` (however Telegram formatted it)."""
+
+    return normalize_command(text) == START_COMMAND
+
+
 # IOC list fields that are merged (union, de-duplicated, sorted) from
 # every message of the same chat before risk is re-scored.
 MERGED_IOC_FIELDS = (
@@ -393,6 +448,54 @@ class TelegramConversationService:
     # ----------------------------------------------------------
     # State access
     # ----------------------------------------------------------
+
+    def handle_start(
+        self,
+        chat_id: int,
+        sender_username: Optional[str] = None,
+    ) -> dict:
+        """
+        Answer the ``/start`` command without touching the LLM.
+
+        Parameters
+        ----------
+        chat_id : int
+            Telegram chat to greet.
+        sender_username : str | None
+            Public @handle of the sender (echoed back only).
+
+        Returns
+        -------
+        dict
+            ``{"chat_id", "reply", "kind": "start", "turn", ...}`` where
+            ``turn`` is the chat's existing turn count (0 for a chat
+            that has not started a case yet).
+
+        Notes
+        -----
+        Deliberately side-effect free: greeting a chat must not create
+        case state, because Telegram sends ``/start`` automatically the
+        first time a user opens the bot. A case is only opened by the
+        first real message.
+        """
+
+        if isinstance(chat_id, bool) or not isinstance(chat_id, int):
+            raise ValueError(
+                "chat_id must be an integer Telegram chat id."
+            )
+
+        if chat_id == 0:
+            raise ValueError("chat_id cannot be 0.")
+
+        state = self.chats.get(chat_id)
+
+        return {
+            "chat_id": chat_id,
+            "reply": START_GREETING,
+            "kind": "start",
+            "turn": state.turn if state is not None else 0,
+            "sender_username": sender_username,
+        }
 
     def _get_or_create_state(
         self,

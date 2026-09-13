@@ -2624,3 +2624,77 @@ body.dark .integ-icon.gmail {
   color: var(--text-4);
   line-height: 1.5;
 }
+
+/* Telegram reply-loop panel inside the Telegram card.
+   A connected bot that is not polling answers nothing, so this panel
+   shows the loop's honest state (running / stopped / unknown) plus
+   Start / Stop / test-hello controls. */
+.integ-loop {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.integ-loop-status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-2);
+  margin: 0;
+}
+
+.integ-loop-stats {
+  font-size: 10.5px;
+  color: var(--text-4);
+  margin: 0;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.integ-loop-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.integ-loop-btn {
+  font-size: 10.5px;
+  padding: 5px 9px;
+}
+
+.integ-loop-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.integ-loop-input {
+  width: 96px;
+  font-size: 11px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--text-1);
+}
+
+.integ-loop-hint {
+  font-size: 10px;
+  color: var(--text-4);
+  line-height: 1.6;
+  margin: 0;
+}
+
+.integ-loop-hint code {
+  font-size: 10px;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--border-light);
+}

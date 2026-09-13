@@ -56,6 +56,11 @@ from agents.conversation_agent import ConversationAgent
 from agents.report_agent import ReportAgent
 
 from tools.adaptive_investigation_engine import AdaptiveInvestigationEngine
+from tools.telegram_conversation_worker import (
+    get_worker,
+    start_worker,
+    stop_worker,
+)
 from tools.conversation_session import ConversationSession
 from tools.evidence_archive import EvidenceArchiver
 from tools.memory_manager import MemoryManager
@@ -504,6 +509,110 @@ def integrations_status():
     return get_all_integration_statuses()
 
 
+# ----------------------------------------------------------
+# Telegram auto-start (the reply loop must not need a manual click)
+# ----------------------------------------------------------
+# A connected bot that is not polling is indistinguishable from a broken
+# bot: the operator sends a message and nothing ever comes back. So the
+# loop is brought up automatically - at boot when the token works, and
+# immediately after a successful Connect - unless the operator turned
+# it off with TELEGRAM_AUTO_START_WORKER=0.
+
+def _telegram_worker_stats() -> Optional[Dict]:
+    """Secret-free worker snapshot (None when the loop never ran)."""
+
+    worker = get_worker()
+
+    return worker.stats() if worker else None
+
+
+def _autostart_telegram_worker(integration) -> Optional[Dict]:
+    """
+    Start the reply loop for a connected Telegram integration.
+
+    Never raises: a polling problem must not turn a successful Connect
+    into an HTTP error - it is reported inside the response instead.
+    """
+
+    if not settings.TELEGRAM_AUTO_START_WORKER:
+        return _telegram_worker_stats()
+
+    try:
+        start_worker(integration)
+
+    except Exception as exc:  # noqa: BLE001 - connect already succeeded
+        logger.warning(
+            "Telegram connected, but the reply loop could not be "
+            "started: %s",
+            exc,
+        )
+        return {
+            "running": False,
+            "start_error": str(exc),
+        }
+
+    stats = _telegram_worker_stats()
+
+    logger.info(
+        "Telegram reply loop started automatically (polls=%s).",
+        (stats or {}).get("polls"),
+    )
+
+    return stats
+
+
+def _bootstrap_telegram_on_boot() -> None:
+    """
+    Connect + start the bot in the background when a token is present.
+
+    Runs in a daemon thread so an unreachable Telegram (or a slow DNS
+    lookup) can never delay application start-up. Silent when the token
+    is simply not configured - that is a normal, supported state.
+    """
+
+    integration = get_integration("telegram")
+
+    if integration is None or not integration.is_configured():
+        logger.info(
+            "Telegram bot token not configured - reply loop not started."
+        )
+        return
+
+    if not settings.TELEGRAM_AUTO_START_WORKER:
+        logger.info(
+            "TELEGRAM_AUTO_START_WORKER is disabled - the bot will not "
+            "poll until /api/telegram/conversation/start is called."
+        )
+        return
+
+    try:
+        if not integration.is_connected():
+            integration.connect()
+
+    except Exception as exc:  # noqa: BLE001 - boot must never fail
+        logger.warning(
+            "Telegram boot connect failed (%s). The bot will not poll "
+            "until POST /api/integrations/telegram/connect succeeds.",
+            exc,
+        )
+        return
+
+    _autostart_telegram_worker(integration)
+
+
+@app.on_event("startup")
+def _startup_bootstrap() -> None:
+    """Kick off the Telegram reply loop without blocking start-up."""
+
+    import threading
+
+    threading.Thread(
+        target=_bootstrap_telegram_on_boot,
+        name="telegram-boot-bootstrap",
+        daemon=True,
+    ).start()
+
+
 @app.post("/api/integrations/{integration_id}/connect")
 def integrations_connect(integration_id: str):
     """
@@ -575,7 +684,22 @@ def integrations_connect(integration_id: str):
         )
 
     # Reached only when connect() performed a real, verified handshake.
-    return integration.get_status().model_dump(mode="json")
+    payload = integration.get_status().model_dump(mode="json")
+
+    if integration_id == "telegram":
+        # Bring the reply loop up straight away: otherwise the operator
+        # has to know about a second endpoint before the bot answers
+        # anything, which is exactly the "bot never replies" trap.
+        payload["worker"] = _autostart_telegram_worker(integration)
+
+        if not (payload.get("worker") or {}).get("running"):
+            payload["next_step"] = (
+                "Reply loop is not running. Check the worker message in "
+                "this response, then POST /api/telegram/conversation/"
+                "start or fix the reported problem."
+            )
+
+    return payload
 
 
 @app.post("/api/integrations/{integration_id}/disconnect")
@@ -621,7 +745,22 @@ def integrations_disconnect(integration_id: str):
             }
         )
 
-    return integration.get_status().model_dump(mode="json")
+    payload = integration.get_status().model_dump(mode="json")
+
+    if integration_id == "telegram":
+        # A disconnected bot must not keep long-polling Telegram with a
+        # session the dashboard no longer claims.
+        try:
+            stop_worker()
+        except Exception as exc:  # noqa: BLE001 - disconnect succeeded
+            logger.warning(
+                "Telegram disconnected, but the reply loop could not be "
+                "stopped: %s", exc,
+            )
+
+        payload["worker"] = _telegram_worker_stats()
+
+    return payload
 
 
 @app.options("/new")

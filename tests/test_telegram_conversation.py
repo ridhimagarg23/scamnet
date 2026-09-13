@@ -212,6 +212,50 @@ class StubTelegramIntegration:
     def is_connected(self):
         return self._connected
 
+    def connect(self):
+        """Stub handshake used by the auto-start tests."""
+
+        self._connected = True
+        self.connect_calls = getattr(self, "connect_calls", 0) + 1
+
+    def disconnect(self):
+        self._connected = False
+
+    def get_status(self):
+        """Real IntegrationStatus so the connect/disconnect endpoints run."""
+
+        from integrations.base import IntegrationState, IntegrationStatus
+
+        return IntegrationStatus(
+            id="telegram",
+            name="Telegram",
+            purpose="Communication & intelligence gathering",
+            configured=True,
+            available=True,
+            connected=self._connected,
+            state=(
+                IntegrationState.CONNECTED
+                if self._connected
+                else IntegrationState.DISCONNECTED
+            ),
+            detail="stub",
+            setup_instructions="set TELEGRAM_BOT_TOKEN",
+            connection_info=self.get_connection_info(),
+        )
+
+    def get_connection_info(self):
+        if not self._connected:
+            return {}
+        return {
+            "bot_username": "scamnet_intel_bot",
+            "webhook_cleared": True,
+        }
+
+    def send_chat_action(self, chat_id, action="typing"):
+        self.chat_actions = getattr(self, "chat_actions", [])
+        self.chat_actions.append({"chat_id": chat_id, "action": action})
+        return True
+
     def get_updates(self, timeout=None, limit=None, ack=None):
 
         self.get_updates_calls.append(

@@ -18,6 +18,11 @@
 //  * The server's ``setup_instructions`` are shown for apps that are not
 //    connected yet, so an operator can see exactly what to put in the
 //    server-side .env instead of guessing.
+//  * Telegram gets a reply-loop panel: a connected bot that is NOT
+//    polling looks identical (from the scammer's side) to a broken bot,
+//    so the modal reports whether the loop is running (push mode),
+//    waiting for fetch calls, or stopped - and offers Start/Stop plus a
+//    one-click "send hello" (POST /conversation/wake) that needs no LLM.
 //
 // Visual pattern: same modal shell as ReportModal (modal-overlay /
 // modal-card / modal-header / modal-body / modal-footer) + namespaced
@@ -29,7 +34,11 @@ import {
   INTEGRATION_FALLBACKS,
   fetchIntegrationStatuses,
   connectIntegration,
-  disconnectIntegration
+  disconnectIntegration,
+  fetchTelegramLoopStatus,
+  startTelegramLoop,
+  stopTelegramLoop,
+  wakeTelegramChat
 } from '@/lib/integrations';
 
 // Per-app icons (inline stroke SVGs, same style as the rest of the UI).
@@ -74,6 +83,12 @@ export default function IntegrationsModal({ isOpen, onClose }) {
   const [loadError, setLoadError] = useState(null);
   // id -> true while its connect request is in flight.
   const [busyMap, setBusyMap] = useState({});
+
+  // Telegram reply loop: { status, worker, diagnostics } or null.
+  const [telegramLoop, setTelegramLoop] = useState(null);
+  const [loopBusy, setLoopBusy] = useState(false);
+  const [loopNotice, setLoopNotice] = useState(null);
+  const [wakeChatId, setWakeChatId] = useState('');
   // id -> { kind: 'setup' | 'error', text } from the last connect attempt.
   const [attempts, setAttempts] = useState({});
 
@@ -95,10 +110,26 @@ export default function IntegrationsModal({ isOpen, onClose }) {
     }
   }, []);
 
+  // The Telegram reply loop's honest state (never 409s on the server).
+  const refreshLoop = useCallback(async () => {
+    try {
+      const data = await fetchTelegramLoopStatus();
+      setTelegramLoop(data);
+    } catch (err) {
+      // A status failure must not break the modal: keep the last known
+      // state and let the card say "unknown".
+      console.error('Telegram loop status error:', err);
+      setTelegramLoop(null);
+    }
+  }, []);
+
   // Load statuses whenever the modal opens.
   useEffect(() => {
-    if (isOpen) refresh();
-  }, [isOpen, refresh]);
+    if (isOpen) {
+      refresh();
+      refreshLoop();
+    }
+  }, [isOpen, refresh, refreshLoop]);
 
   // Forward a real connect attempt to the backend and render its
   // honest outcome. No local success state is ever fabricated.
@@ -158,6 +189,83 @@ export default function IntegrationsModal({ isOpen, onClose }) {
       }));
     } finally {
       setBusyMap((prev) => ({ ...prev, [id]: false }));
+    }
+  };
+
+  // Start/stop the Telegram reply loop (the bot's polling worker).
+  const handleLoopToggle = async (shouldRun) => {
+    setLoopBusy(true);
+    setLoopNotice(null);
+
+    try {
+      const result = shouldRun
+        ? await startTelegramLoop()
+        : await stopTelegramLoop();
+
+      if (!result.ok) {
+        setLoopNotice({ kind: 'error', text: result.error });
+      } else if (shouldRun) {
+        setLoopNotice({
+          kind: 'ok',
+          text: 'Reply loop running - inbound messages are answered automatically.'
+        });
+      } else {
+        setLoopNotice({
+          kind: 'setup',
+          text:
+            'Loop stopped. Messages now wait in Telegram until the loop ' +
+            'is started again (or a fetch call picks them up).'
+        });
+      }
+
+      await refreshLoop();
+    } catch (err) {
+      console.error('Telegram loop request error:', err);
+      setLoopNotice({
+        kind: 'error',
+        text: 'Backend unreachable - cannot change the reply loop right now.'
+      });
+    } finally {
+      setLoopBusy(false);
+    }
+  };
+
+  // One-click outbound proof: sends the liveness greeting to a chat id.
+  const handleWake = async () => {
+    const chatId = Number(wakeChatId);
+
+    if (!Number.isInteger(chatId) || chatId === 0) {
+      setLoopNotice({
+        kind: 'error',
+        text: 'Enter the numeric chat id the bot should greet.'
+      });
+      return;
+    }
+
+    setLoopBusy(true);
+    setLoopNotice(null);
+
+    try {
+      const result = await wakeTelegramChat(chatId);
+
+      setLoopNotice(
+        result.ok
+          ? {
+              kind: 'ok',
+              text: `Hello sent to chat ${chatId} (message id ${result.body?.message_id}).`
+            }
+          : { kind: 'error', text: result.error }
+      );
+
+      await refreshLoop();
+    } catch (err) {
+      console.error('Telegram wake error:', err);
+      setLoopNotice({
+        kind: 'error',
+        text: 'Backend unreachable - cannot send a test message right now.'
+      });
+    } finally {
+      setLoopBusy(false);
     }
   };
 
@@ -234,6 +342,17 @@ export default function IntegrationsModal({ isOpen, onClose }) {
     return { name, purpose, kind: 'off', label: 'Not connected', detail: st.detail || '', setup, configured, attempt: null };
   };
 
+  // Honest summary of the Telegram reply loop for the card panel.
+  const loopRunning = Boolean(telegramLoop?.running);
+  const worker = telegramLoop?.worker || null;
+  const lastError = worker?.last_error || null;
+
+  const loopLabel = !telegramLoop
+    ? 'Loop status unknown'
+    : loopRunning
+      ? `Reply loop running (polling${worker?.poll_timeout != null ? `, ${worker.poll_timeout}s long-poll` : ''})`
+      : 'Reply loop stopped - messages wait until it is started';
+
   return (
     <div className="modal-overlay" id="integrationsModal" onClick={onClose}>
       {/* Stop propagation so clicks inside the card don't close it */}
@@ -306,6 +425,99 @@ export default function IntegrationsModal({ isOpen, onClose }) {
                           .join(' · ')}
                       </p>
                     )}
+
+                  {/* Telegram reply loop: a connected bot that is not
+                      polling never answers anything, so its state and
+                      controls live right on the card. */}
+                  {id === 'telegram' && view.kind === 'connected' && (
+                    <div className="integ-loop">
+                      <p className="integ-loop-status">
+                        <span
+                          className={`integ-dot ${loopRunning ? 'connected' : 'off'}`}
+                        />
+                        {loopLabel}
+                      </p>
+
+                      {worker && (
+                        <p className="integ-loop-stats">
+                          {worker.polls} poll(s) · {worker.processed} answered
+                          {worker.failed ? ` · ${worker.failed} failed` : ''}
+                          {worker.greetings ? ` · ${worker.greetings} greeting(s)` : ''}
+                          {worker.last_poll_at ? ` · last poll ${worker.last_poll_at}` : ''}
+                        </p>
+                      )}
+
+                      {lastError && (
+                        <p className="integ-message error">{lastError}</p>
+                      )}
+
+                      {loopNotice && (
+                        <p className={`integ-message ${loopNotice.kind}`}>
+                          {loopNotice.text}
+                        </p>
+                      )}
+
+                      <div className="integ-loop-actions">
+                        <button
+                          className="btn-outline integ-loop-btn"
+                          type="button"
+                          disabled={loopBusy || loopRunning}
+                          onClick={() => handleLoopToggle(true)}
+                        >
+                          {loopRunning ? 'Loop running' : 'Start loop'}
+                        </button>
+
+                        <button
+                          className="btn-outline integ-loop-btn"
+                          type="button"
+                          disabled={loopBusy || !loopRunning}
+                          onClick={() => handleLoopToggle(false)}
+                        >
+                          Stop loop
+                        </button>
+
+                        <button
+                          className="btn-outline integ-loop-btn"
+                          type="button"
+                          disabled={loopBusy}
+                          onClick={refreshLoop}
+                        >
+                          Recheck loop
+                        </button>
+                      </div>
+
+                      <div className="integ-loop-actions">
+                        <input
+                          className="integ-loop-input"
+                          type="text"
+                          inputMode="numeric"
+                          placeholder="chat id"
+                          value={wakeChatId}
+                          onChange={(event) => setWakeChatId(event.target.value)}
+                          aria-label="Chat id to greet"
+                        />
+                        <button
+                          className="btn-outline integ-loop-btn"
+                          type="button"
+                          disabled={loopBusy}
+                          onClick={handleWake}
+                        >
+                          Send test hello
+                        </button>
+                      </div>
+
+                      <p className="integ-loop-hint">
+                        Replies go to the chat that messaged the bot.
+                        &quot;Send test hello&quot; proves the outbound path
+                        immediately (it needs no LLM); sending
+                        <code> /start</code> to the bot in Telegram does the
+                        same thing. On hosts that suspend background
+                        threads, leave the loop stopped and call
+                        <code> POST /api/telegram/conversation/fetch</code>{' '}
+                        from a scheduler instead.
+                      </p>
+                    </div>
+                  )}
 
                   {/* What the operator must do on the SERVER to make
                       this app connect (env vars + credentials file). */}

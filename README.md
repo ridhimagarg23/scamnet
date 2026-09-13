@@ -351,7 +351,10 @@ service itself accepted the credentials.
 | `POST /api/integrations/{id}/disconnect` | Drops the live session without touching credentials |
 | `GET /health` | Liveness + `llm_configured` (reports `degraded` without an LLM key) |
 | `GET /api/telegram/messages` · `POST /api/telegram/send-test` | Telegram communication test endpoints |
-| `POST /api/telegram/conversation/message` · `/start` · `/stop` · `/status` | The Telegram ↔ ConversationAgent loop (per-chat state) |
+| `POST /api/telegram/conversation/start` · `/stop` | Start/stop the background reply loop (long-polling worker) |
+| `POST /api/telegram/conversation/fetch` | Poll **once** and answer everything - the same loop for hosts that cannot keep a thread alive (cron / uptime pinger) |
+| `POST /api/telegram/conversation/wake` | Send the liveness greeting to one chat - proves the outbound path with no LLM |
+| `POST /api/telegram/conversation/message` · `GET /status` · `POST /reset` · `GET /commands` | Manual turn, honest loop+chat state, per-chat reset, bot commands |
 
 When Drive/Sheets are connected, each `POST /analyze` turn also **archives the
 case** (report uploaded/updated in Drive, case row upserted in Sheets). The
@@ -360,11 +363,62 @@ best-effort and never breaks an investigation.
 
 ### Attaching the persona to a live scammer
 
-1. Set `TELEGRAM_BOT_TOKEN`, restart the backend, connect Telegram in the UI.
-2. `POST /api/telegram/conversation/start` begins polling; every inbound message
-   is investigated and answered by the undercover persona automatically.
-3. Watch it with `GET /api/telegram/conversation/status`, stop it with
-   `/stop` or reset one chat with `/reset`.
+1. Set `TELEGRAM_BOT_TOKEN` (from @BotFather) and restart the backend.
+2. Connect Telegram in the dashboard, or `POST /api/integrations/telegram/connect`.
+   The connect step **verifies the token with `getMe`, clears any webhook that
+   would block `getUpdates`, publishes the `/start` command and starts the reply
+   loop** - all in one call. (Set `TELEGRAM_AUTO_START_WORKER=0` to keep the loop
+   manual.)
+3. Every inbound message is investigated and answered by the undercover persona
+   automatically; the reply is length-checked in Telegram's own unit (UTF-16 code
+   units) and retried once if Telegram rate-limits it (HTTP 429).
+4. Watch it with `GET /api/telegram/conversation/status` (polls, answered,
+   greetings, last poll, last error), stop it with `/stop`, and reset one chat
+   with `/reset`.
+
+**How the bot behaves**
+
+| Message | What happens |
+|---|---|
+| any text | investigation + persona reply (needs the LLM key) |
+| `/start` · `/START` · `/start@your_bot` | fixed greeting, **no LLM needed**, never opens a case |
+| photo / sticker / voice / edit / channel post | ignored safely (never crashes the loop) |
+
+**Delivery models** - both use one shared worker and can never poll at the same
+time, so a message is never answered twice:
+
+* **push** - `/conversation/start` long-polls on a background thread (default,
+  replies in seconds). Best on Render/Railway/a VPS.
+* **fetch** - call `POST /api/telegram/conversation/fetch` from cron / an uptime
+  pinger / a GitHub Action. Identical brain; works on hosts that suspend the
+  process between requests, where a background thread would quietly stop.
+
+**Testing the bot without a real bot token**
+
+```bash
+# terminal 1 - fake Telegram Bot API + fake LLM gateway
+.venv/bin/python scripts/telegram_simulator.py
+
+# terminal 2 - the REAL backend pointed at the fakes
+TELEGRAM_BOT_TOKEN="99999:SIMULATOR-TOKEN" \
+TELEGRAM_API_BASE="http://127.0.0.1:8099" \
+OPENROUTER_API_KEY="simulator-key" \
+OPENROUTER_BASE_URL="http://127.0.0.1:8098/v1" \
+.venv/bin/uvicorn backend.api:app --port 8001
+
+# terminal 3 - the "scammer" writes to the bot, then read what it answered
+curl -X POST http://127.0.0.1:8099/_push -H 'Content-Type: application/json' \
+     -d '{"chat_id": 424242, "text": "Your card is blocked, verify now"}'
+curl http://127.0.0.1:8099/_state
+```
+
+`scripts/e2e_telegram_check.py` automates exactly that against the real HTTP
+API (connect -> auto-start -> message in -> persona reply out -> second turn ->
+`/start` -> stop -> fetch mode -> disconnect) and exits non-zero on any failure:
+
+```bash
+.venv/bin/python scripts/e2e_telegram_check.py
+```
 
 ---
 
@@ -391,6 +445,9 @@ best-effort and never breaks an investigation.
 ## ⚠️ Limitations & Roadmap
 
 - **In-memory sessions** — state resets on restart; swap in Redis for horizontal scale.
+- **Telegram loop is single-process** — one bot token polls one process. Run the
+  fetch endpoint (not `/conversation/start`) when you scale to several replicas,
+  or Telegram will answer `409` to the overlapping `getUpdates` calls.
 - **JSON-file memory** — per-run archive on ephemeral hosts; a real DB is needed for durable history.
 - **Static personas** — backend returns no avatar; the frontend maps occupations to avatar PNGs.
 - **Stub UI actions** — History / Saved Cases / Edit Persona are placeholders.

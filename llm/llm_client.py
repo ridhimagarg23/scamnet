@@ -56,8 +56,10 @@ class LLMClient:
         """
         Build the underlying OpenAI client.
 
-        Note: we only talk to OpenRouter's gateway
+        By default we talk to OpenRouter's gateway
         (``https://openrouter.ai/api/v1``), never to OpenAI directly.
+        ``OPENROUTER_BASE_URL`` overrides the gateway for self-hosted
+        OpenAI-compatible servers or test doubles.
 
         Raises
         ------
@@ -76,7 +78,7 @@ class LLMClient:
 
         self.client = OpenAI(
             api_key=settings.OPENROUTER_API_KEY,
-            base_url="https://openrouter.ai/api/v1",
+            base_url=settings.OPENROUTER_BASE_URL,
         )
 
         self.model = settings.LLM_MODEL
