@@ -5,8 +5,8 @@ Curated LLM model catalogs for every supported provider.
 
 The catalog feeds TWO consumers:
 
-* the dashboard's model picker (``GET /api/llm/models``) - so the
-  analyst can choose a provider + model without editing files;
+* ``GET /api/llm/models`` - a diagnostic listing of what the
+  server can call (the dashboard has no picker any more);
 * the fallback documentation - spare models tried automatically when
   the primary model fails (see ``LLMClient`` and the
   ``*_FALLBACK_MODELS`` variables in ``.env.example``).
@@ -64,51 +64,37 @@ logger = logging.getLogger("TraceAI-ModelCatalog")
 # mid-size, "balanced" = quality/latency trade-off, "powerful" = largest
 # reasoning models (slowest, most expensive).
 
+# The NVIDIA stage is intentionally a two-model list:
+# Nemotron 3 Ultra answers first, Nemotron 3.5 Lightning is its
+# fallback. (Order matters - see ``NVIDIA_STAGE_MODELS`` in config.py.)
 NVIDIA_CATALOG: list = [
     {
-        "id": "meta/llama-3.1-8b-instruct",
-        "label": "Llama 3.1 8B Instruct",
-        "description": "Lightning-fast default for scam chat. Best latency.",
-        "speed": "lightning",
-        "recommended": True,
-    },
-    {
-        "id": "mistralai/mistral-7b-instruct-v0.3",
-        "label": "Mistral 7B Instruct v0.3",
-        "description": "Very fast small model, great fallback.",
-        "speed": "lightning",
-        "recommended": True,
-    },
-    {
-        "id": "google/gemma-2-9b-it",
-        "label": "Gemma 2 9B IT",
-        "description": "Fast instruction-tuned model, strong JSON output.",
-        "speed": "fast",
-        "recommended": False,
-    },
-    {
-        "id": "meta/llama-3.1-70b-instruct",
-        "label": "Llama 3.1 70B Instruct",
-        "description": "High-quality large model for hard verdicts.",
-        "speed": "balanced",
-        "recommended": False,
-    },
-    {
-        "id": "nvidia/llama-3.1-nemotron-70b-instruct",
-        "label": "Llama 3.1 Nemotron 70B",
-        "description": "NVIDIA-tuned 70B, excellent instruction following.",
-        "speed": "balanced",
-        "recommended": False,
-    },
-    {
-        "id": "mistralai/mixtral-8x7b-instruct-v0.1",
-        "label": "Mixtral 8x7B Instruct",
-        "description": "MoE powerhouse for complex investigations.",
+        "id": "nvidia/nemotron-3-ultra-550b-a55b",
+        "label": "Nemotron 3 Ultra 550B",
+        "description": (
+            "Priority NVIDIA fallback (build.nvidia.com). Frontier "
+            "reasoning, 262k context."
+        ),
         "speed": "powerful",
-        "recommended": False,
+        "recommended": True,
+    },
+    {
+        "id": "nvidia/nemotron-3.5-lightning-30b-a3b",
+        "label": "Nemotron 3.5 Lightning 30B",
+        "description": (
+            "Second NVIDIA fallback - used only when Ultra fails or is "
+            "too slow."
+        ),
+        "speed": "lightning",
+        "recommended": True,
     },
 ]
 
+# OpenRouter is the provider every turn STARTS on, so this list is
+# just the primary model (plus any id you add via llm_models.json /
+# OPENROUTER_MODELS). Extra OpenRouter spares are only used when you
+# set OPENROUTER_FALLBACK_MODELS - the default flow goes straight to
+# the NVIDIA stage when OpenRouter is too slow (see config.py).
 OPENROUTER_CATALOG: list = [
     {
         "id": "qwen/qwen3-32b",
@@ -116,34 +102,6 @@ OPENROUTER_CATALOG: list = [
         "description": "Default OpenRouter model. Strong structured output.",
         "speed": "balanced",
         "recommended": True,
-    },
-    {
-        "id": "meta-llama/llama-3.1-8b-instruct",
-        "label": "Llama 3.1 8B (OpenRouter)",
-        "description": "Fast + cheap fallback for quick turns.",
-        "speed": "fast",
-        "recommended": True,
-    },
-    {
-        "id": "mistralai/mistral-7b-instruct",
-        "label": "Mistral 7B (OpenRouter)",
-        "description": "Fast small fallback.",
-        "speed": "fast",
-        "recommended": False,
-    },
-    {
-        "id": "google/gemini-flash-1.5",
-        "label": "Gemini Flash 1.5",
-        "description": "Google's fast model via OpenRouter.",
-        "speed": "fast",
-        "recommended": False,
-    },
-    {
-        "id": "anthropic/claude-3.5-sonnet",
-        "label": "Claude 3.5 Sonnet",
-        "description": "Top-tier reasoning for difficult cases (slower).",
-        "speed": "powerful",
-        "recommended": False,
     },
 ]
 

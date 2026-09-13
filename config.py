@@ -24,14 +24,20 @@ Optional environment variables
 * ``LLM_PROVIDER``        - Active LLM provider: ``openrouter`` (default)
                             or ``nvidia`` (NVIDIA NIM - the fastest option).
                             When unset, the server auto-selects: OpenRouter
-                            if its key exists, else NVIDIA NIM. The dashboard
-                            can switch this at runtime (POST /api/llm/select).
+                            if its key exists, else NVIDIA NIM. The request
+                            flow is fixed (OpenRouter first, NVIDIA as the
+                            fallback stage), so this only matters when
+                            OpenRouter is not configured at all.
 * ``LLM_MODEL``           - OpenRouter model id used when the active
                             provider is OpenRouter. Defaults to
                             ``qwen/qwen3-32b``.
 * ``NVIDIA_NIM_MODEL``    - NVIDIA NIM model id used when the active
-                            provider is NVIDIA. Defaults to the lightning-fast
-                            ``meta/llama-3.1-8b-instruct``.
+                            provider is NVIDIA. Defaults to
+                            ``nvidia/nemotron-3-ultra-550b-a55b``.
+* ``OPENROUTER_DEADLINE`` - Seconds the OpenRouter call may take before it
+                            is abandoned and the NVIDIA stage starts
+                            (default ``15``). ``LLM_PRIMARY_DEADLINE`` is a
+                            synonym; ``0`` disables the deadline.
 * ``OPENROUTER_BASE_URL`` - OpenAI-compatible gateway root for OpenRouter.
                             Defaults to ``https://openrouter.ai/api/v1``.
 * ``NVIDIA_NIM_BASE_URL`` - NVIDIA NIM gateway root. Defaults to
@@ -42,6 +48,9 @@ Optional environment variables
                             bad output, unknown model...). ``LLM_FALLBACK_MODELS``
                             is a shared shorthand applied to both providers
                             when the provider-specific variable is empty.
+                            The NVIDIA stage always contains the two
+                            nemotron models (ultra then lightning) whatever
+                            these variables hold.
 * ``LLM_CROSS_PROVIDER_FALLBACK``
                           - ``1`` (default) lets a failing provider fall
                             back to the OTHER provider's models (when its
@@ -49,12 +58,12 @@ Optional environment variables
 * ``OPENROUTER_TIMEOUT`` / ``NVIDIA_NIM_TIMEOUT`` / ``LLM_TIMEOUT``
                           - Per-request timeout in seconds (provider-specific
                             wins, else the shared ``LLM_TIMEOUT``). Defaults:
-                            90 s for OpenRouter, 30 s for NVIDIA NIM so a
+                            90 s for OpenRouter, 45 s for NVIDIA NIM so a
                             slow call fails over to the next model quickly.
 * ``OPENROUTER_MODELS`` / ``NVIDIA_NIM_MODELS``
                           - Comma-separated EXTRA model ids appended to the
-                            dashboard's model picker (for brand-new models
-                            that are not in the curated catalog yet).
+                            model catalog (for brand-new models that are
+                            not in the curated catalog yet).
 * ``CORS_ALLOW_ORIGINS``  - Comma-separated browser origins allowed to
                             call the API cross-origin. Defaults to the
                             local dev origins + the hosted dashboard.
@@ -135,23 +144,47 @@ PROVIDER_ALIASES = {
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
-#: Default primary models per provider. NVIDIA's default is a small,
-#: lightning-fast instruction model - the whole point of adding NIM.
+#: Default primary model for OpenRouter (the provider every turn starts
+#: on - see ``PRIMARY_PROVIDER`` below).
 DEFAULT_OPENROUTER_MODEL = "qwen/qwen3-32b"
-DEFAULT_NVIDIA_MODEL = "meta/llama-3.1-8b-instruct"
 
-#: Built-in fallback chains (used when no *_FALLBACK_MODELS env var is
-#: set). The primary model is always tried first; these are only the
-#: automatic spares, fastest/cheapest first.
-DEFAULT_OPENROUTER_FALLBACKS = (
-    "meta-llama/llama-3.1-8b-instruct",
-    "mistralai/mistral-7b-instruct",
-)
-DEFAULT_NVIDIA_FALLBACKS = (
-    "mistralai/mistral-7b-instruct-v0.3",
-    "google/gemma-2-9b-it",
-    "meta/llama-3.1-70b-instruct",
-)
+# ----------------------------------------------------------------------
+# NVIDIA NIM fallback stage
+# ----------------------------------------------------------------------
+# The NVIDIA stage is deliberately tiny: exactly TWO models, tried in
+# this order. Nemotron 3 Ultra is the priority; Nemotron 3.5 Lightning
+# only answers when Ultra fails / is too slow.
+NVIDIA_PRIMARY_MODEL = "nvidia/nemotron-3-ultra-550b-a55b"
+NVIDIA_SECONDARY_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"
+
+#: Ordered NVIDIA fallback stage (ultra first, lightning only as its
+#: fallback). Kept as a tuple so nothing can mutate it by accident.
+NVIDIA_STAGE_MODELS = (NVIDIA_PRIMARY_MODEL, NVIDIA_SECONDARY_MODEL)
+
+DEFAULT_NVIDIA_MODEL = NVIDIA_PRIMARY_MODEL
+
+#: Built-in spares for OpenRouter: NONE. The request flow is
+#: "OpenRouter -> (no answer inside OPENROUTER_DEADLINE) -> NVIDIA
+#: stage". Add ``OPENROUTER_FALLBACK_MODELS`` only if you really want
+#: extra OpenRouter spares before the NVIDIA hop.
+DEFAULT_OPENROUTER_FALLBACKS = ()
+
+#: Provider every turn STARTS on. A pasted scammer message always goes
+#: to OpenRouter first; NVIDIA NIM is the fallback stage (never the
+#: first stop) unless OpenRouter is not configured at all.
+PRIMARY_PROVIDER = PROVIDER_OPENROUTER
+
+#: Soft deadline (seconds) for the PRIMARY provider. When OpenRouter has
+#: not answered within this window the call is abandoned and the NVIDIA
+#: stage starts immediately - the analyst never waits on a slow gateway.
+#: ``0`` disables the deadline (wait for the provider timeout instead).
+DEFAULT_PRIMARY_DEADLINE = 15.0
+
+#: Default per-request timeouts (seconds).
+DEFAULT_OPENROUTER_TIMEOUT = 90.0
+#: The NVIDIA stage runs very large models (550B), so it needs a little
+#: more room than a small instruct model before it is declared too slow.
+DEFAULT_NVIDIA_TIMEOUT = 45.0
 
 
 # Truthy spellings accepted for boolean environment flags.
@@ -195,6 +228,29 @@ def _env_list(*names: str) -> list:
             ]
 
     return []
+
+
+def _dedupe(models) -> list:
+    """
+    Drop empty + repeated model ids while preserving order.
+
+    Used to build the fallback chains: a model id that already appears
+    earlier (or is the primary model) is never tried twice.
+    """
+
+    seen: set = set()
+    ordered: list = []
+
+    for model in models:
+        model_id = str(model or "").strip()
+
+        if not model_id or model_id in seen:
+            continue
+
+        seen.add(model_id)
+        ordered.append(model_id)
+
+    return ordered
 
 
 def _env_float(name: str, default: float) -> float:
@@ -306,24 +362,42 @@ class Settings:
         ).strip() or DEFAULT_NVIDIA_MODEL
 
         # ------------------------------------------------------
-        # Fallback chains (automatic spares, fastest first)
+        # Fallback chains
         # ------------------------------------------------------
-        # Provider-specific variables win; LLM_FALLBACK_MODELS is the
-        # shared shorthand; built-in defaults cover the unset case.
+        # OpenRouter: none by default (it hands over to NVIDIA after
+        # its deadline). NVIDIA: always ultra -> lightning.
 
-        self.OPENROUTER_FALLBACK_MODELS = (
-            _env_list("OPENROUTER_FALLBACK_MODELS", "LLM_FALLBACK_MODELS")
-            or list(DEFAULT_OPENROUTER_FALLBACKS)
+        self.OPENROUTER_FALLBACK_MODELS = _env_list(
+            "OPENROUTER_FALLBACK_MODELS", "LLM_FALLBACK_MODELS"
+        ) or list(DEFAULT_OPENROUTER_FALLBACKS)
+
+        # NVIDIA stage = ultra -> lightning, always, in that order.
+        # Extra ids from the env are appended AFTER the two nemotron
+        # models so a custom NIM deployment can still add local spares.
+        self.NVIDIA_FALLBACK_MODELS = _dedupe(
+            [
+                *NVIDIA_STAGE_MODELS,
+                *_env_list(
+                    "NVIDIA_NIM_FALLBACK_MODELS",
+                    "NVIDIA_FALLBACK_MODELS",
+                    "LLM_FALLBACK_MODELS",
+                ),
+            ]
         )
 
-        self.NVIDIA_FALLBACK_MODELS = (
-            _env_list(
-                "NVIDIA_NIM_FALLBACK_MODELS",
-                "NVIDIA_FALLBACK_MODELS",
-                "LLM_FALLBACK_MODELS",
+        configured_nvidia_model = os.getenv("NVIDIA_NIM_MODEL", "").strip()
+
+        if (
+            configured_nvidia_model
+            and configured_nvidia_model not in NVIDIA_STAGE_MODELS
+        ):
+            logging.getLogger("TraceAI-Config").warning(
+                "NVIDIA_NIM_MODEL='%s' is set, but the NVIDIA fallback "
+                "stage always runs %s (in that order). Leave "
+                "NVIDIA_NIM_MODEL empty to use Nemotron 3 Ultra.",
+                configured_nvidia_model,
+                " -> ".join(NVIDIA_STAGE_MODELS),
             )
-            or list(DEFAULT_NVIDIA_FALLBACKS)
-        )
 
         # When True (default), a provider whose whole chain failed falls
         # back to the OTHER provider's chain (if its key is configured).
@@ -347,12 +421,31 @@ class Settings:
 
         self.OPENROUTER_TIMEOUT = _env_float(
             "OPENROUTER_TIMEOUT",
-            generic_value or 90.0,
+            generic_value or DEFAULT_OPENROUTER_TIMEOUT,
         )
         self.NVIDIA_NIM_TIMEOUT = _env_float(
             "NVIDIA_NIM_TIMEOUT",
-            generic_value or 30.0,
+            generic_value or DEFAULT_NVIDIA_TIMEOUT,
         )
+
+        # ------------------------------------------------------
+        # Soft deadlines (how long the PRIMARY provider may take
+        # before the NVIDIA stage takes over)
+        # ------------------------------------------------------
+        # The OpenRouter call is abandoned after this many seconds -
+        # the analyst gets an answer from NVIDIA instead of staring
+        # at a spinner. ``0`` disables the deadline for a provider.
+
+        self.LLM_PRIMARY_DEADLINE = _env_float(
+            "LLM_PRIMARY_DEADLINE", DEFAULT_PRIMARY_DEADLINE
+        )
+
+        self.OPENROUTER_DEADLINE = _env_float(
+            "OPENROUTER_DEADLINE", self.LLM_PRIMARY_DEADLINE
+        )
+        # The NVIDIA stage is the last resort, so it is not cut short
+        # by default (set NVIDIA_NIM_DEADLINE to bound it too).
+        self.NVIDIA_NIM_DEADLINE = _env_float("NVIDIA_NIM_DEADLINE", 0.0)
 
         # ------------------------------------------------------
         # Active provider + model (runtime-switchable selection)
@@ -372,6 +465,10 @@ class Settings:
             # No key at all: default to OpenRouter so the dashboard and
             # the 503 guidance name the historical provider first.
             active_provider = PROVIDER_OPENROUTER
+
+        #: Provider every turn starts on (OpenRouter). Only used to keep
+        #: the "OpenRouter first, NVIDIA as fallback" order explicit.
+        self.PRIMARY_PROVIDER = PRIMARY_PROVIDER
 
         self.ACTIVE_PROVIDER = active_provider
         self.ACTIVE_MODEL = self.get_default_model(active_provider)
@@ -579,6 +676,21 @@ class Settings:
             return self.NVIDIA_NIM_TIMEOUT
 
         return self.OPENROUTER_TIMEOUT
+
+    def get_deadline(self, provider: str | None) -> float:
+        """
+        Return the soft deadline (seconds) for a provider's stage.
+
+        ``LLMClient.generate`` abandons the provider once this many
+        seconds have elapsed since its FIRST attempt in the current
+        call and moves on to the next model in the chain. ``0`` means
+        "no deadline" (the per-request timeout is the only limit).
+        """
+
+        if normalize_provider(provider) == PROVIDER_NVIDIA:
+            return self.NVIDIA_NIM_DEADLINE
+
+        return self.OPENROUTER_DEADLINE
 
     def provider_key_name(self, provider: str | None) -> str:
         """Return the env var name holding the provider's key."""

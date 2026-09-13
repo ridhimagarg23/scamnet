@@ -2,12 +2,18 @@
 test_llm_providers.py
 =====================
 Offline unit tests for the multi-provider LLM layer (OpenRouter +
-NVIDIA NIM) and its automatic fallback chain.
+NVIDIA NIM) and its FIXED request flow:
+
+    OpenRouter (LLM_MODEL)
+      -> no answer within OPENROUTER_DEADLINE (15 s)?
+         -> NVIDIA: nvidia/nemotron-3-ultra-550b-a55b
+           -> NVIDIA: nvidia/nemotron-3.5-lightning-30b-a3b
 
 * provider normalization / aliases (``nim`` -> ``nvidia``);
 * active provider/model resolution + runtime switching;
-* ``LLMClient.attempt_chain()`` ordering (primary -> spares ->
-  other provider);
+* ``LLMClient.attempt_chain()`` ordering (OpenRouter -> NVIDIA stage);
+* the 15 s soft deadline (a slow OpenRouter is abandoned, never
+  retried, and the NVIDIA stage answers);
 * fallback on invalid JSON / unknown-model errors (next spare
   answers, the failure is recorded, the call succeeds);
 * total failure raises RuntimeError listing every tried model;
@@ -16,13 +22,47 @@ NVIDIA NIM) and its automatic fallback chain.
 
 Run with:
 
-    OPENROUTER_API_KEY=test-key python -m unittest discover -s tests
+    OPENROUTER_API_KEY=test-key NVIDIA_NIM_API_KEY=test-key \
+        python -m unittest discover -s tests
 """
 
 import unittest
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
-from config import normalize_provider
+from config import normalize_provider, settings
+
+#: The two models of the NVIDIA fallback stage (ultra has priority).
+NVIDIA_ULTRA = "nvidia/nemotron-3-ultra-550b-a55b"
+NVIDIA_LIGHTNING = "nvidia/nemotron-3.5-lightning-30b-a3b"
+
+
+@contextmanager
+def both_providers_configured():
+    """
+    Give BOTH providers a key for the duration of the block.
+
+    The fallback chain only contains the NVIDIA stage when its key is
+    present, so every fallback test needs this.
+    """
+
+    with patch.object(settings, "OPENROUTER_API_KEY", "test-key"), patch.object(
+        settings, "NVIDIA_NIM_API_KEY", "nvapi-test-key"
+    ):
+        yield
+
+
+class _FakeClock:
+    """A monotonic clock the test controls (no real sleeping)."""
+
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
 
 
 def _fake_completion(text: str):
@@ -137,10 +177,26 @@ class TestAttemptChain(unittest.TestCase):
     def test_chain_has_no_duplicates(self):
         from llm.llm_client import LLMClient
 
-        chain = LLMClient(provider="openrouter").attempt_chain()
+        with both_providers_configured():
+            chain = LLMClient(provider="openrouter").attempt_chain()
 
         self.assertEqual(len(chain), len(set(chain)))
         self.assertGreaterEqual(len(chain), 1)
+
+    def test_flow_is_openrouter_first_then_nvidia_stage(self):
+        """Pasted message -> OpenRouter -> ultra -> lightning."""
+
+        from llm.llm_client import LLMClient
+
+        with both_providers_configured():
+            chain = LLMClient().attempt_chain()
+
+        self.assertEqual(chain[0][0], "openrouter")
+        self.assertEqual(chain[0][1], settings.LLM_MODEL)
+
+        nvidia_models = [model for provider, model in chain if provider == "nvidia"]
+
+        self.assertEqual(nvidia_models, [NVIDIA_ULTRA, NVIDIA_LIGHTNING])
 
 
 class TestFallbackBehaviour(unittest.TestCase):
@@ -163,8 +219,9 @@ class TestFallbackBehaviour(unittest.TestCase):
             create_side_effect
         )
 
-        client = LLMClient(provider="openrouter", model="primary/model")
-        result = client.generate("hi", json_output=True)
+        with both_providers_configured():
+            client = LLMClient(provider="openrouter", model="primary/model")
+            result = client.generate("hi", json_output=True)
 
         self.assertEqual(result, {"ok": True})
         self.assertEqual(len(tried), 2)
@@ -192,8 +249,9 @@ class TestFallbackBehaviour(unittest.TestCase):
             create_side_effect
         )
 
-        client = LLMClient(provider="openrouter", model="primary/model")
-        result = client.generate("hi")
+        with both_providers_configured():
+            client = LLMClient(provider="openrouter", model="primary/model")
+            result = client.generate("hi")
 
         self.assertEqual(result, "hello")
         # The dead id is attempted exactly ONCE, then the spare answers.
@@ -314,14 +372,153 @@ class TestLlmEndpoints(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 400)
 
 
+class TestFixedRequestFlow(unittest.TestCase):
+    """
+    The dashboard has no provider picker any more: one pasted message
+    goes to OpenRouter first and only falls back to the NVIDIA
+    nemotron stage when OpenRouter is too slow (15 s) or fails.
+    """
+
+    def setUp(self):
+        from llm.llm_client import LLMClient
+
+        self.LLMClient = LLMClient
+
+    def test_nvidia_stage_is_ultra_then_lightning(self):
+        self.assertEqual(settings.get_default_model("nvidia"), NVIDIA_ULTRA)
+        self.assertEqual(
+            settings.get_fallback_models("nvidia")[:2],
+            [NVIDIA_ULTRA, NVIDIA_LIGHTNING],
+        )
+
+    def test_openrouter_deadline_defaults_to_15_seconds(self):
+        self.assertEqual(settings.get_deadline("openrouter"), 15.0)
+
+    @patch("llm.llm_client.OpenAI")
+    def test_primary_inside_deadline_never_calls_nvidia(self, mock_openai_cls):
+        clock = _FakeClock()
+
+        def create_side_effect(**kwargs):
+            clock.advance(3)  # answered well inside the 15 s window
+            return _fake_completion('{"ok": true}')
+
+        mock_openai_cls.return_value.chat.completions.create.side_effect = (
+            create_side_effect
+        )
+
+        with both_providers_configured(), patch("llm.llm_client._now", clock):
+            client = self.LLMClient()
+            result = client.generate("hi", json_output=True)
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(client.last_provider, "openrouter")
+        self.assertEqual(client.last_model, settings.LLM_MODEL)
+        self.assertEqual(client.fallbacks_used, [])
+
+    @patch("llm.llm_client.OpenAI")
+    def test_slow_primary_falls_through_to_nemotron_ultra(
+        self, mock_openai_cls
+    ):
+        clock = _FakeClock()
+        tried = []
+
+        def create_side_effect(**kwargs):
+            tried.append(kwargs["model"])
+
+            if kwargs["model"] == "primary/model":
+                clock.advance(20)  # blew the 15 s OpenRouter deadline
+                raise Exception("APITimeoutError: Request timed out.")
+
+            return _fake_completion('{"ok": true}')
+
+        mock_openai_cls.return_value.chat.completions.create.side_effect = (
+            create_side_effect
+        )
+
+        with both_providers_configured(), patch("llm.llm_client._now", clock):
+            client = self.LLMClient(
+                provider="openrouter", model="primary/model"
+            )
+            result = client.generate("hi", json_output=True)
+
+        self.assertEqual(result, {"ok": True})
+        # OpenRouter is attempted ONCE - a blown deadline is not retried.
+        self.assertEqual(tried, ["primary/model", NVIDIA_ULTRA])
+        self.assertEqual(client.last_provider, "nvidia")
+        self.assertEqual(client.last_model, NVIDIA_ULTRA)
+        self.assertEqual(len(client.fallbacks_used), 1)
+        self.assertEqual(client.fallbacks_used[0]["provider"], "openrouter")
+        self.assertEqual(client.fallbacks_used[0]["model"], "primary/model")
+
+    @patch("llm.llm_client.OpenAI")
+    def test_ultra_failure_ends_on_lightning(self, mock_openai_cls):
+        clock = _FakeClock()
+        tried = []
+
+        def create_side_effect(**kwargs):
+            tried.append(kwargs["model"])
+
+            if kwargs["model"] != NVIDIA_LIGHTNING:
+                clock.advance(20)
+                raise Exception("upstream 500")
+
+            return _fake_completion('{"ok": true}')
+
+        mock_openai_cls.return_value.chat.completions.create.side_effect = (
+            create_side_effect
+        )
+
+        with both_providers_configured(), patch("llm.llm_client._now", clock):
+            client = self.LLMClient(
+                provider="openrouter", model="primary/model"
+            )
+            result = client.generate("hi", json_output=True, retries=1)
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(client.last_model, NVIDIA_LIGHTNING)
+        self.assertEqual(
+            tried,
+            ["primary/model", NVIDIA_ULTRA, NVIDIA_LIGHTNING],
+        )
+
+    @patch("llm.llm_client.OpenAI")
+    def test_request_timeout_is_capped_by_the_deadline(
+        self, mock_openai_cls
+    ):
+        clock = _FakeClock()
+        timeouts = []
+
+        def create_side_effect(**kwargs):
+            timeouts.append(kwargs.get("timeout"))
+            clock.advance(60)
+            raise Exception("timeout")
+
+        mock_openai_cls.return_value.chat.completions.create.side_effect = (
+            create_side_effect
+        )
+
+        with both_providers_configured(), patch("llm.llm_client._now", clock):
+            client = self.LLMClient(
+                provider="openrouter", model="primary/model"
+            )
+
+            with self.assertRaises(RuntimeError):
+                client.generate("hi", retries=1)
+
+        # OpenRouter may never be given more than its 15 s budget...
+        self.assertLessEqual(timeouts[0], 15.0)
+        # ...while the NVIDIA stage keeps its own (longer) timeout.
+        self.assertEqual(timeouts[1], settings.get_timeout("nvidia"))
+
+
 class TestModelCatalog(unittest.TestCase):
 
-    def test_nvidia_catalog_has_fast_default(self):
+    def test_nvidia_catalog_lists_only_the_two_stage_models(self):
         from llm.model_catalog import get_model_ids
 
         ids = get_model_ids("nvidia")
 
-        self.assertIn("meta/llama-3.1-8b-instruct", ids)
+        self.assertEqual(ids, [NVIDIA_ULTRA, NVIDIA_LIGHTNING])
 
     def test_describe_unknown_model_synthesizes_entry(self):
         from llm.model_catalog import describe_model
