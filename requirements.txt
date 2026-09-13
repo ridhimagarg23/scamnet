@@ -13,6 +13,13 @@ python-dotenv==1.2.2
 pydantic==2.13.4
 
 # ------------------------------------------------------------------
+# SCAMNET integrations
+# (direct HTTP client for the Telegram Bot API; also a transitive
+# dependency of openai - pinned explicitly since we now import it)
+# ------------------------------------------------------------------
+httpx==0.28.1
+
+# ------------------------------------------------------------------
 # Frontend build / misc tooling pulled in by earlier experimentation
 # (kept only if actually used; not required by backend/api.py)
 # ------------------------------------------------------------------

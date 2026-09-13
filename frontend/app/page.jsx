@@ -22,6 +22,7 @@ import PersonaPanel from '@/components/PersonaPanel';
 import ChatPanel from '@/components/ChatPanel';
 import OverviewPanel from '@/components/OverviewPanel';
 import ReportModal from '@/components/ReportModal';
+import IntegrationsModal from '@/components/IntegrationsModal';
 import ErrorToast from '@/components/ErrorToast';
 import { INITIAL_DASHBOARD_DATA, THINKING_STEPS } from '@/lib/constants';
 
@@ -42,6 +43,7 @@ export default function DashboardPage() {
   const [thinkingStep, setThinkingStep] = useState(THINKING_STEPS[0]);
   const [errorMessage, setErrorMessage] = useState(null);
   const [isReportOpen, setIsReportOpen] = useState(false);
+  const [isIntegrationsOpen, setIsIntegrationsOpen] = useState(false);
   const [timerSeconds, setTimerSeconds] = useState(0);
 
   const timerRef = useRef(null);
@@ -256,6 +258,7 @@ export default function DashboardPage() {
       <Sidebar
         onNewInvestigation={handleNewInvestigation}
         onGenerateReport={handleGenerateReport}
+        onShowIntegrations={() => setIsIntegrationsOpen(true)}
         onShowNotImplemented={handleShowNotImplemented}
         isDark={isDark}
         onToggleDark={handleToggleDark}
@@ -307,6 +310,13 @@ export default function DashboardPage() {
         isOpen={isReportOpen}
         report={dashboardData.report}
         onClose={() => setIsReportOpen(false)}
+      />
+
+      {/* SCAMNET Connected Apps: honest integration status
+          (Telegram / Google Sheets / Google Drive) */}
+      <IntegrationsModal
+        isOpen={isIntegrationsOpen}
+        onClose={() => setIsIntegrationsOpen(false)}
       />
 
       <ErrorToast

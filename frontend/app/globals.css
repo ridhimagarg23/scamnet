@@ -9,6 +9,7 @@
    3. Layout scaffolding (.sidebar / .main / .topbar / .content-row)
    4. Per-panel styles (Persona / Chat / Overview + modals)
    5. Utilities (.text-brand, .mb-2, ioc-highlight, badges)
+   6. Connected Apps / Integrations modal (.integ-*)
 */
 
 /* ═══════════════════════════════════════════
@@ -2310,4 +2311,263 @@ body.dark .bsb-text {
     width: 100%;
     justify-content: center;
   }
+}
+
+/* ═══════════════════════════════════════════
+   6. CONNECTED APPS / INTEGRATIONS MODAL
+   SCAMNET external-app status cards (.integ-*).
+   Reuses the shared modal shell (section 4) and
+   the design tokens, so dark mode works via the
+   same CSS variables - no theme-specific colours
+   except the per-app icon accents below.
+   ═══════════════════════════════════════════ */
+
+.integ-intro {
+  font-size: 12px;
+  color: var(--text-3);
+  margin-bottom: 14px;
+  line-height: 1.55;
+}
+
+.integ-error-banner {
+  background: var(--danger-bg);
+  border: 1px solid var(--danger-border);
+  color: var(--danger);
+  border-radius: var(--r-md);
+  padding: 10px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 14px;
+  line-height: 1.5;
+}
+
+/* One card per external app (Telegram / Sheets / Drive) */
+.integ-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: 14px;
+  margin-bottom: 12px;
+  box-shadow: var(--shadow-xs);
+}
+
+.integ-icon {
+  width: 38px;
+  height: 38px;
+  min-width: 38px;
+  border-radius: var(--r-md);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--brand-light);
+  color: var(--brand);
+}
+
+.integ-icon svg {
+  width: 19px;
+  height: 19px;
+}
+
+/* Per-app icon accents (light theme) */
+.integ-icon.telegram {
+  background: #E0F2FE;
+  color: #0284C7;
+}
+
+.integ-icon.google_sheets {
+  background: var(--brand-muted);
+  color: var(--brand-mid);
+}
+
+.integ-icon.google_drive {
+  background: #FEF3C7;
+  color: #D97706;
+}
+
+/* Per-app icon accents (dark theme) */
+body.dark .integ-icon.telegram {
+  background: rgba(56, 189, 248, 0.14);
+  color: #38BDF8;
+}
+
+body.dark .integ-icon.google_sheets {
+  background: rgba(34, 197, 94, 0.14);
+  color: #4ADE80;
+}
+
+body.dark .integ-icon.google_drive {
+  background: rgba(245, 158, 11, 0.14);
+  color: #FBBF24;
+}
+
+.integ-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.integ-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 2px;
+}
+
+.integ-title-row h4 {
+  font-size: 12.5px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  color: var(--text-1);
+}
+
+/* State pill next to the app name */
+.integ-badge {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+
+.integ-badge.connected {
+  background: var(--success-bg);
+  color: var(--success);
+  border-color: var(--success-border);
+}
+
+.integ-badge.setup {
+  background: var(--warning-bg);
+  color: var(--warning);
+  border-color: var(--warning-border);
+}
+
+.integ-badge.error {
+  background: var(--danger-bg);
+  color: var(--danger);
+  border-color: var(--danger-border);
+}
+
+.integ-badge.off,
+.integ-badge.unknown {
+  background: var(--border-light);
+  color: var(--text-3);
+  border-color: var(--border);
+}
+
+.integ-purpose {
+  font-size: 11.5px;
+  color: var(--text-3);
+  margin-bottom: 8px;
+}
+
+/* "● Not connected" status line */
+.integ-status-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.integ-dot {
+  width: 8px;
+  height: 8px;
+  min-width: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  background: var(--text-4);
+}
+
+.integ-dot.connected {
+  background: var(--success);
+  box-shadow: 0 0 0 3px var(--success-bg);
+}
+
+.integ-dot.setup {
+  background: var(--warning);
+  box-shadow: 0 0 0 3px var(--warning-bg);
+}
+
+.integ-dot.error {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px var(--danger-bg);
+}
+
+/* Server-provided, secret-free state explanation */
+.integ-detail {
+  font-size: 11px;
+  color: var(--text-4);
+  margin-top: 6px;
+  line-height: 1.5;
+}
+
+/* Honest outcome of the last connect attempt */
+.integ-message {
+  font-size: 11px;
+  margin-top: 6px;
+  padding: 7px 9px;
+  border-radius: var(--r-sm);
+  line-height: 1.5;
+}
+
+.integ-message.setup {
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-border);
+  color: var(--warning);
+}
+
+.integ-message.error {
+  background: var(--danger-bg);
+  border: 1px solid var(--danger-border);
+  color: var(--danger);
+}
+
+.integ-action {
+  display: flex;
+  align-items: center;
+}
+
+.integ-connect-btn {
+  white-space: nowrap;
+}
+
+.integ-connect-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* Replaces the Connect button ONLY when the server reports a real,
+   health-verified authenticated session */
+.integ-connected-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--success);
+  background: var(--success-bg);
+  border: 1px solid var(--success-border);
+  border-radius: 999px;
+  padding: 6px 12px;
+  white-space: nowrap;
+}
+
+.integ-connected-chip svg {
+  width: 12px;
+  height: 12px;
+}
+
+/* Footer security note (shares .modal-footer with the Recheck button) */
+.integ-note {
+  flex: 1;
+  font-size: 10.5px;
+  color: var(--text-4);
+  line-height: 1.5;
 }
